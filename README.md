@@ -231,7 +231,8 @@ As for the increase in Compensation Memory and the reduction in Weight Memory an
 | **TOPS** | 22.02 | **28.56** |  
   
 ## FloorPlan  :  
-...  
+<img width="1301" height="825" alt="Floorplan drawio" src="https://github.com/user-attachments/assets/d20385d1-bfac-48e6-9012-8e4e88177edd" />
+
   
 ## Reference : 
 **[0] [Weight-Aware and Reduced-Precision Architecture Designs for Low-Cost AI Accelerators](https://hdl.handle.net/11296/zs6qk8)**   
