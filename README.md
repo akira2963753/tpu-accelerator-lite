@@ -1,4 +1,4 @@
-# Low-Cost AI Accelerator Based on TPU    
+# Low-Cost AI Accelerator Based on TPU v1    
 We build upon the **MSR-4 data** characteristic proposed in our senior’s thesis [0]  , which helps **reduce weight bit-length**, and further design a compensation architecture to **compensate the loss caused by Non-MSR-4 data.**   
    
 The proposed design **delivers +6.54 TOPS** over the INT8 TPU baseline. With minimal hardware overhead, the system attains **accuracy surpassing INT8 quantization on MLP & LeNet.**   
