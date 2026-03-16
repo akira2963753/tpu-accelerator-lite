@@ -47,20 +47,11 @@ Low Cost AI Accelerator Based on TPU /
 └── README.md                 
 ```  
 
-
-## Tensor Processing Unit (TPU) [1] :  
-<img width="1116" height="839" alt="image" src="https://github.com/user-attachments/assets/47d3af4e-3567-4cf8-bcb4-d5f5aa79293b" />   
-
 ## Data Flow (OS/WS/IS) [2] [3] :  
-The systolic array architecture supports three mainstream dataflow methods: Output Stationary (OS), Weight Stationary (WS), and Input Stationary (IS).    
-  
-<img width="1846" height="722" alt="image" src="https://github.com/user-attachments/assets/c6f07320-1c2e-4bca-9610-6f9131aaee00" />  
-  
+The systolic array architecture supports three mainstream dataflow methods: Output Stationary (OS), Weight Stationary (WS), and Input Stationary (IS).      
 We use the Weight Stationary (WS) data flow to implement our TPU architecture.  
 The weight data will be preloaded into each Processing Element (PE), and the activation values will be fed into the systolic array using a +45-degree diagonal flow.    
-   
-<img width="1664" height="877" alt="image" src="https://github.com/user-attachments/assets/c114ffd9-b225-458d-9e16-d64c49b8c25d" />   
-   
+
 ## Most Significant Runs (MSR) [4] :  
 
 Deep neural network models are typically trained using 32-bit floating-point operations. After training, the resulting weight values are also in 32-bit floating-point format. However, to reduce computational resources and **inference time**, deep neural networks often perform inference computations using fixed-point arithmetic. Since most weights are close to zero, when these weights are converted to fixed-point representation, as shown in the figure below, we often observe consecutive 1s or 0s in the most significant bits. This phenomenon is referred to as ***Most Significant Runs (MSR)***.  
@@ -139,12 +130,6 @@ Next, the TPU operates using a Weight-Stationary (WS) dataflow. The weights and 
 In this project, for implementation convenience, we made some slight adjustments to the memory architecture by configuring it to output 8 data values per access. In practice, each memory block can be regarded as consisting of 8 individual SRAMs, enabling it to output 8 data entries simultaneously.   
 
 <img width="382" height="282" alt="Mem_Wrapper drawio" src="https://github.com/user-attachments/assets/d1f4d5f6-fa5a-4654-9f34-1e341b465f50" />  
-
-## Memory Read Control : 
-After the Mem_Write signal is asserted and completed, the system prepares to read from the Weight Memory and Compensation Memory in order to preload the weight data into the PE of the Systolic Array. Therefore, once Mem_Write finishes, I assert Mem_Rd_en on the falling edge to trigger the memory read. Then, on the next falling edge, the Pre_LoadWeight and Pre_LoadCWeight signals are asserted, allowing the previously fetched data to be successfully loaded into the systolic array. The same mechanism applies to the Activation Memory. After the weight preloading is complete, activations are introduced. To improve efficiency, we can assert Mem_Rd_en on the falling edge just before the last weight preload, so that in the next cycle, when Cal is asserted on the falling edge and the PEs begin computation on the rising edge, the corresponding activation data can be immediately provided to the input buffer—thus speeding up the overall operation.  
-    
-<img width="1479" height="265" alt="image" src="https://github.com/user-attachments/assets/38a219e8-0829-4202-b606-5d9f348363e4" />     
-<img width="1483" height="381" alt="image" src="https://github.com/user-attachments/assets/c862e6f0-32f7-44e1-a536-39cbc3576a18" />      
    
 ## RTL Simulation :   
 We use 8x8 Systolic Array and 8x3 Compensation Array to simulate the proposed architecture.  
