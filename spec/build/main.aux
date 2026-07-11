@@ -1,0 +1,44 @@
+\relax 
+\providecommand\hyper@newdestlabel[2]{}
+\providecommand*\HyPL@Entry[1]{}
+\HyPL@Entry{0<</S/D>>}
+\HyPL@Entry{1<</S/D>>}
+\@writefile{toc}{\contentsline {chapter}{\numberline {1}Introduction}{2}{chapter.1}\protected@file@percent }
+\@writefile{lof}{\addvspace {10\p@ }}
+\@writefile{lot}{\addvspace {10\p@ }}
+\newlabel{ch:introduction}{{1}{2}{Introduction}{chapter.1}{}}
+\@writefile{toc}{\contentsline {chapter}{\numberline {2}Background}{3}{chapter.2}\protected@file@percent }
+\@writefile{lof}{\addvspace {10\p@ }}
+\@writefile{lot}{\addvspace {10\p@ }}
+\newlabel{ch:background}{{2}{3}{Background}{chapter.2}{}}
+\@writefile{toc}{\contentsline {section}{\numberline {2.1}INT8 Quantization for DNN Inference}{3}{section.2.1}\protected@file@percent }
+\newlabel{eq:int8-quantization}{{2.1}{3}{INT8 Quantization for DNN Inference}{equation.2.1}{}}
+\newlabel{eq:int8-dot-product}{{2.2}{3}{INT8 Quantization for DNN Inference}{equation.2.2}{}}
+\@writefile{toc}{\contentsline {section}{\numberline {2.2}Most Significant Runs}{3}{section.2.2}\protected@file@percent }
+\newlabel{eq:msr4-predicate}{{2.4}{3}{Most Significant Runs}{equation.2.4}{}}
+\@writefile{lof}{\contentsline {figure}{\numberline {2.1}{\ignorespaces Example conversion from floating-point weight data to fixed-point words. Underlined leading bits illustrate MSR candidates.}}{4}{figure.caption.2}\protected@file@percent }
+\providecommand*\caption@xref[2]{\@setref\relax\@undefined{#1}}
+\newlabel{fig:msr-quantization}{{2.1}{4}{Example conversion from floating-point weight data to fixed-point words. Underlined leading bits illustrate MSR candidates}{figure.caption.2}{}}
+\@writefile{toc}{\contentsline {section}{\numberline {2.3}MSR-4 Weight Encoding}{4}{section.2.3}\protected@file@percent }
+\@writefile{lot}{\contentsline {table}{\numberline {2.1}{\ignorespaces MSR-4-Aware Per-Weight Encoding}}{4}{table.caption.3}\protected@file@percent }
+\newlabel{tab:weight-encoding}{{2.1}{4}{MSR-4-Aware Per-Weight Encoding}{table.caption.3}{}}
+\newlabel{eq:msr4-reconstruction}{{2.5}{4}{MSR-4 Weight Encoding}{equation.2.5}{}}
+\@writefile{toc}{\contentsline {chapter}{\numberline {3}Motivation}{6}{chapter.3}\protected@file@percent }
+\@writefile{lof}{\addvspace {10\p@ }}
+\@writefile{lot}{\addvspace {10\p@ }}
+\newlabel{ch:motivation}{{3}{6}{Motivation}{chapter.3}{}}
+\@writefile{toc}{\contentsline {section}{\numberline {3.1}Why MSR-4 Is the Selected Operating Point}{6}{section.3.1}\protected@file@percent }
+\@writefile{lot}{\contentsline {table}{\numberline {3.1}{\ignorespaces Observed MSR Coverage of INT8 Weight Data}}{6}{table.caption.4}\protected@file@percent }
+\newlabel{tab:msr-coverage}{{3.1}{6}{Observed MSR Coverage of INT8 Weight Data}{table.caption.4}{}}
+\@writefile{toc}{\contentsline {section}{\numberline {3.2}MSR-4 Exception Density and Compensation Capacity}{6}{section.3.2}\protected@file@percent }
+\newlabel{eq:exception-density}{{3.1}{6}{MSR-4 Exception Density and Compensation Capacity}{equation.3.1}{}}
+\newlabel{eq:lenet-exceptions}{{3.2}{6}{MSR-4 Exception Density and Compensation Capacity}{equation.3.2}{}}
+\@writefile{toc}{\contentsline {section}{\numberline {3.3}Expected-Value Approximation and Sparse Compensation}{7}{section.3.3}\protected@file@percent }
+\newlabel{eq:lsb-error}{{3.3}{7}{Expected-Value Approximation and Sparse Compensation}{equation.3.3}{}}
+\newlabel{eq:dot-product-error}{{3.4}{7}{Expected-Value Approximation and Sparse Compensation}{equation.3.4}{}}
+\@writefile{lof}{\contentsline {figure}{\numberline {3.1}{\ignorespaces MSR-4-aware weight processing and sparse compensation. MSR-4 weights use the reduced path; non-MSR-4 weights produce a reduced contribution and a compensation contribution that are merged in the accumulator.}}{7}{figure.caption.5}\protected@file@percent }
+\newlabel{fig:msr-calculation}{{3.1}{7}{MSR-4-aware weight processing and sparse compensation. MSR-4 weights use the reduced path; non-MSR-4 weights produce a reduced contribution and a compensation contribution that are merged in the accumulator}{figure.caption.5}{}}
+\@writefile{toc}{\contentsline {section}{\numberline {3.4}Verification Implications}{7}{section.3.4}\protected@file@percent }
+\bibcite{project-readme}{1}
+\bibcite{weight-aware-thesis}{2}
+\gdef \@abspage@last{9}
