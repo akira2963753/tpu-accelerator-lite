@@ -1,4 +1,5 @@
 +incdir+./
++incdir+../00_TESTBED
 -sverilog ./define.vh
 -sverilog ./WPU.sv
 -sverilog ./WMEM_Wrapper.sv

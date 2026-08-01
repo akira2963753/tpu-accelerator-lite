@@ -20,6 +20,8 @@ module TSC (
     input [`N_W-1:0] dim_n,
     input [`QMULT_W-1:0] quant_mult, // per-tensor requant multiplier M0 (latched with dims)
     input [`QSHIFT_W-1:0] quant_shift, // per-tensor requant right-shift n (latched with dims)
+    input fuse_in, // 1 = take activation from OBUF (previous layer's output), no host stream
+    input fuse_out, // 1 = also write this job's results into OBUF for the next layer
     output logic busy,
     output logic done,
 
@@ -37,11 +39,18 @@ module TSC (
     output logic wmem_en_c, // WMEM chip enable
     output logic wmem_en_w, // WMEM write enable (1=write, 0=read)
 
-    // internal : UB (dual-port)
+    // internal : UB activation window (dual-port)
     output logic [`AMEM_ADDR_W-1:0] ub_addr_w,
     output logic [`AMEM_ADDR_W-1:0] ub_addr_r,
     output logic ub_en_w,
     output logic ub_en_r,
+
+    // internal : OBUF layer-fusion buffer (dual-port)
+    output logic [`OBUF_ADDR_W-1:0] obuf_addr_w,
+    output logic [`OBUF_ADDR_W-1:0] obuf_addr_r,
+    output logic obuf_en_w,
+    output logic obuf_en_r,
+    output logic act_sel, // 1 = Data_Setup takes OBUF data instead of UB data
 
     // internal : systolic arrays / skew
     output logic weight_valid, // 1=PRELOAD push weights, 0=CAL compute
@@ -69,14 +78,14 @@ module TSC (
     localparam CACC_LAT = 2; // CSA compensation latency (column-aligned, no skew)
     localparam CAL_DRAIN = 2*`ARRAY_S + 4; // must cover RESULT_LAT + column de-skew (15) tail
     localparam CAL_TOTAL = ACT_N + CAL_DRAIN;
-    localparam UB_HALF = 1 << (`AMEM_ADDR_W - 1); // ping-pong : split UB into two halves
+    localparam OBUF_TSEL_W = `OBUF_ADDR_W - `ROW_IDX_W; // OBUF 16-row tile select = 3
 
     typedef enum logic [2:0] {IDLE, LOADING, PRELOAD_W, CAL, OUT, DONE} STATETYPE;
     STATETYPE state, nx_state;
 
     // C [M x N] = A [M x K] x W [K x N]
-    logic [`M_W-1:0] m_tiles; 
-    logic [`K_W-1:0] k_tiles;   
+    logic [`M_W-1:0] m_tiles;
+    logic [`K_W-1:0] k_tiles;
     logic [`N_W-1:0] n_tiles;
 
     // tile counter
@@ -89,19 +98,20 @@ module TSC (
     logic [5:0] cc; // cal counter
     logic [4:0] ov; // outvalue counter
 
-    // a and w loading counter
-    logic [`AMEM_ADDR_W:0] a_cnt;
+    // a and w loading counter : one 16-row tile each, per (mt,nt,kt)
+    logic [`ROW_IDX_W:0] a_cnt;
     logic [4:0] w_cnt;
 
-    // activation rows for one mt = 16 * k_tiles (<= UB depth)
-    logic [`AMEM_ADDR_W:0] a_total; 
-    always_comb a_total = k_tiles << $clog2(`ARRAY_S);
+    // descriptor-held fusion mode
+    logic fuse_in_q, fuse_out_q;
 
-    // load bookkeeping
-    wire load_a = (nt == 0) && (kt == 0); // activations loaded only at first tile of an mt
-    wire a_done = !load_a || (a_cnt == a_total); // activation load complete (or not needed)
+    // load bookkeeping. Activation is now streamed one k-tile at a time for every
+    // (mt,nt,kt) instead of caching all of A[16 x K] : that is what decouples UB
+    // depth from K and lets K_MAX be 4096 with only two 16-deep macros.
+    wire load_a = !fuse_in_q; // a fused job reads its activation straight from OBUF
+    wire a_done = !load_a || (a_cnt == `ARRAY_S); // activation tile loaded (or not needed)
     wire w_done = (w_cnt == `ARRAY_S); // weight load complete (16 beats)
-    wire a_beat = (state == LOADING) && a_valid && load_a && (a_cnt != a_total); // accepted A beat
+    wire a_beat = (state == LOADING) && a_valid && load_a && (a_cnt != `ARRAY_S); // accepted A beat
     wire w_beat = (state == LOADING) && w_valid && (w_cnt != `ARRAY_S); // accepted W beat
 
     // psum de-skew shift chain : {en,row} shifted one column per cycle (45-deg de-skew)
@@ -113,26 +123,19 @@ module TSC (
     // WMEM write strobe : delayed 1 cycle to align with WPU's registered encode output
     logic wmem_wr_q;
 
-    // ping-pong : one UB half is this layer's input (load + CAL read), the other is its
-    // output (result write-back). Phase flips each job so the next layer reads what this
-    // one wrote. pp=0 : input=[0..], output=[HALF..] ; pp=1 : swapped.
-    logic pp;
-    wire [`AMEM_ADDR_W-1:0] in_base  = pp ? UB_HALF[`AMEM_ADDR_W-1:0] : '0;
-    wire [`AMEM_ADDR_W-1:0] out_base = pp ? '0 : UB_HALF[`AMEM_ADDR_W-1:0];
-
     // next-state (comb)
     always_comb begin
         case (state)
             // 'IDLE' -> 'LOADING' when cmd_valid = 1
             IDLE: nx_state = (cmd_valid)? LOADING : IDLE;
 
-            // 'LOADING' (Load extra w and a into memory) -> 'PRELOAD_W' when w and a done 
+            // 'LOADING' (Load one w and a tile into memory) -> 'PRELOAD_W' when w and a done
             LOADING : nx_state = (a_done && w_done)? PRELOAD_W : LOADING;
 
             // 'PRELOAD_W' (Preload weight into rsa and csa) -> 'CAL' when finish preloading
             PRELOAD_W : nx_state = (pw == `ARRAY_S)? CAL : PRELOAD_W;
 
-            // 'CAL' (Matrix Multiplication) -> 'LOADING' when 1 tile finished 
+            // 'CAL' (Matrix Multiplication) -> 'LOADING' when 1 tile finished
             // 'CAL' (Matrix Multiplication) -> 'OUT' when all k tile finished
             CAL: begin
                 if(cc == CAL_TOTAL-1) nx_state = (kt != k_tiles-1)? LOADING : OUT;
@@ -183,8 +186,10 @@ module TSC (
             n_tiles <= 0;
             quant_mult_q <= '0;
             quant_shift_q <= '0;
+            fuse_in_q <= 1'b0;
+            fuse_out_q <= 1'b0;
             mt <= 0;
-            nt <= 0; 
+            nt <= 0;
             kt <= 0;
             a_cnt <= 0;
             w_cnt <= 0;
@@ -192,7 +197,6 @@ module TSC (
             cc <= 0;
             ov <= 0;
             wmem_wr_q <= 1'b0;
-            pp <= 1'b0;
         end
         else begin
             // sample the matrix configuration when cmd_valid and reset the counter
@@ -202,12 +206,14 @@ module TSC (
                 n_tiles <= dim_n >> $clog2(`ARRAY_S);
                 quant_mult_q <= quant_mult;
                 quant_shift_q <= quant_shift;
+                fuse_in_q <= fuse_in;
+                fuse_out_q <= fuse_out;
                 mt <= 0;
-                nt <= 0; 
+                nt <= 0;
                 kt <= 0;
             end
 
-            // load beat counters for weight and activation
+            // load beat counters for weight and activation (one tile each)
             if (state == LOADING) begin
                 if (a_beat) a_cnt <= a_cnt + 1;
                 if (w_beat) w_cnt <= w_cnt + 1;
@@ -225,9 +231,9 @@ module TSC (
                 PRELOAD_W : pw <= (pw == `ARRAY_S) ? 5'd0 : pw + 5'd1;
                 CAL : cc <= (cc == CAL_TOTAL-1) ? 6'd0 : cc + 6'd1;
                 OUT : if (r_ready) ov <= (ov == `ARRAY_S-1) ? 5'd0 : ov + 5'd1;
-                default : begin 
-                    pw <= 0; 
-                    cc <= 0; 
+                default : begin
+                    pw <= 0;
+                    cc <= 0;
                 end
             endcase
 
@@ -235,7 +241,7 @@ module TSC (
             if (state == CAL && cc == CAL_TOTAL-1 && kt != k_tiles-1) kt <= kt + 1;
             if (state == OUT && r_ready && ov == `ARRAY_S-1) begin
                 if (nt != n_tiles-1) begin
-                    nt <= nt + 1; 
+                    nt <= nt + 1;
                     kt <= 0; // next output column block
                 end
                 else if (mt != m_tiles-1) begin
@@ -244,9 +250,6 @@ module TSC (
                     kt <= 0; // next A row block
                 end
             end
-
-            // flip ping-pong phase per job : next layer reads from this layer's output half
-            if (state == DONE) pp <= ~pp;
         end
     end
 
@@ -257,7 +260,7 @@ module TSC (
         busy = (state != IDLE);
         done = (state == DONE);
 
-        a_ready = (state == LOADING) && load_a && (a_cnt != a_total);
+        a_ready = (state == LOADING) && load_a && (a_cnt != `ARRAY_S);
         w_ready = (state == LOADING) && (w_cnt != `ARRAY_S);
         r_valid = (state == OUT);
 
@@ -271,28 +274,35 @@ module TSC (
         wmem_en_c = wmem_wr_q || (state == PRELOAD_W && pw <= `ARRAY_S-1);
         wmem_en_w = wmem_wr_q; // write strobe delayed to WPU output ; 0 during preload (read)
 
-        // UB : ping-pong halves. input region (in_base) holds this layer's activation
-        // (host load + CAL read) ; output region (out_base) takes the result write-back,
-        // so results never clobber activation that later nt/mt still reuse.
-        // write port shared : activation load (LOADING, in_base) + write-back (OUT, out_base)
-        if (state == OUT) begin
-            // store result row (m=ov) of block (mt,nt) where the next layer reads it as
-            // activation (k'-tile = nt, row = m) -> on-chip layer fusion.
-            ub_addr_w = out_base + `AMEM_ADDR_W'((nt << $clog2(`ARRAY_S)) + ov);
-            ub_en_w = r_ready; // write each row once, paced by the result handshake
-        end
-        else begin
-            ub_addr_w = a_beat ? (in_base + a_cnt[`AMEM_ADDR_W-1:0]) : '0;
-            ub_en_w = a_beat;
-        end
-        // read : CAL feeds activation vector, row(m,kt) stored at (kt*ARRAY_S + m)
-        ub_addr_r = (state == CAL && cc < ACT_N)? (in_base + `AMEM_ADDR_W'((kt << $clog2(`ARRAY_S)) + cc)) : '0;
-        ub_en_r = (state == CAL) && (cc < ACT_N);
+        // UB : activation streaming window. The tile loaded in LOADING(kt) is the
+        // tile read back in CAL(kt), so write and read select the same half ; the
+        // kt[0] parity keeps the two halves alive for a future load/compute overlap.
+        // A fused job never fills the window, so keep its read port idle too --
+        // otherwise the UB macros toggle every CAL cycle for data nobody selects.
+        ub_addr_w = a_beat ? {kt[0], a_cnt[`ROW_IDX_W-1:0]} : '0;
+        ub_en_w = a_beat;
+        ub_addr_r = (!fuse_in_q && state == CAL && cc < ACT_N) ? {kt[0], cc[`ROW_IDX_W-1:0]} : '0;
+        ub_en_r = !fuse_in_q && (state == CAL) && (cc < ACT_N);
+
+        // OBUF : layer fusion.
+        //  write -> result row m of block (mt,nt) at [nt*16 + m]  (needs M<=16, N<=OBUF_D)
+        //  read  -> next layer's activation row (kt,m) at [kt*16 + m] (needs K<=OBUF_D)
+        // The range guards stop an over-sized job from wrapping and corrupting the
+        // buffer ; PATTERN's SVA flags the illegal descriptor.
+        obuf_addr_w = {nt[OBUF_TSEL_W-1:0], ov[`ROW_IDX_W-1:0]};
+        obuf_en_w = fuse_out_q && (state == OUT) && r_ready && (nt < `OBUF_TILES);
+        obuf_addr_r = (state == CAL && cc < ACT_N) ? {kt[OBUF_TSEL_W-1:0], cc[`ROW_IDX_W-1:0]} : '0;
+        obuf_en_r = fuse_in_q && (state == CAL) && (cc < ACT_N) && (kt < `OBUF_TILES);
+        act_sel = fuse_in_q;
 
         // arrays / skew
         // weight_valid aligned to the arriving (1-cycle-late) WMEM data : pw=1..16
         weight_valid = (state == PRELOAD_W) && (pw != 0);
-        skew_en = (state == CAL); // keep high through drain to flush skew
+        // UB / OBUF are synchronous-read memories: cc=0 launches the first
+        // read, and the corresponding activation arrives one cycle later.
+        // Do not inject the invalid first Q value into the RSA skew pipeline;
+        // keep advancing for the remaining CAL cycles so the array still drains.
+        skew_en = (state == CAL) && (cc >= 1);
         // clear compensation state at the start of each tile's weight load (before cout_valid pulses)
         comp_clr = (state == LOADING) && (w_cnt == 0);
         csa_cw_valid = (state == PRELOAD_W) && (pw != 0);

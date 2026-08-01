@@ -1,1 +1,47 @@
-./spec
+# ---- generated verification patterns -------------------------------------
+# Regenerate with :  cd src/00_TESTBED && python3 python/gen_suite.py [--big]
+# test_suite.svh and suite_summary.txt ARE tracked -- they document the suite.
+src/00_TESTBED/pattern/
+src/10_VERI/*/00_TESTBED/pattern/
+
+# ---- VCS / Verdi ----------------------------------------------------------
+simv
+simv.*
+csrc/
+*.daidir/
+ucli.key
+vc_hdrs.h
+*.fsdb
+*.vpd
+novas.*
+verdiLog/
+nWaveLog/
+DVEfiles/
+
+# ---- Design Compiler / IC Compiler II -------------------------------------
+Netlist/
+Report/
+Work/
+command.log
+default.svf
+*.mr
+*.pvl
+*.syn
+syn.log
+alib-*/
+
+# ---- python ---------------------------------------------------------------
+__pycache__/
+*.pyc
+
+# ---- LaTeX spec build -----------------------------------------------------
+spec/build/
+*.aux
+*.toc
+*.out
+*.synctex.gz
+
+# ---- editor / OS ----------------------------------------------------------
+.$*.bkp
+*~
+.DS_Store

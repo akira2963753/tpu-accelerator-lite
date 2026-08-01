@@ -1,0 +1,15 @@
++incdir+../01_RTL
+-sverilog ../01_RTL/define.vh
+-sverilog ../01_RTL/WPU.sv
+-sverilog ../01_RTL/WMEM_Wrapper.sv
+-sverilog ../01_RTL/CMEM.sv
+-sverilog ../01_RTL/UB_Wrapper.sv
+-sverilog ../01_RTL/Data_Setup.sv
+-sverilog ../01_RTL/RPE.sv
+-sverilog ../01_RTL/RSA.sv
+-sverilog ../01_RTL/CPE.sv
+-sverilog ../01_RTL/CSA.sv
+-sverilog ../01_RTL/ACC.sv
+-sverilog ../01_RTL/OP.sv
+-sverilog ../01_RTL/TSC.sv
+-sverilog ../01_RTL/TPU.sv

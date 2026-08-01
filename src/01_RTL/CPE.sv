@@ -8,8 +8,6 @@
 *
 ******************************************************************************/
 
-// According to Compensated Processing Unit Hardware
-
 module CPE (
     input clk,
     input rst_n,

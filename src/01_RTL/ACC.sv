@@ -46,9 +46,6 @@ module ACC (
         end
     end
 
-    // accumulate memory : clear -> add compensation (once) / add psum (per k_tile)
-    // NOTE : TSC schedules the compensation window and the psum window so they
-    //        never write the SAME [c][row] on the same cycle.
     always_ff @(posedge clk or negedge rst_n) begin
         if(!rst_n) begin
             for(int c = 0; c < `ARRAY_S; c++)

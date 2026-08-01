@@ -20,6 +20,9 @@ module TPU (
     // per-tensor requant constants (latched with the descriptor)
     input [`QMULT_W-1:0] quant_mult,
     input [`QSHIFT_W-1:0] quant_shift,
+    // on-chip layer fusion (latched with the descriptor)
+    input fuse_in,  // activation comes from OBUF (previous layer) : no host a_data
+    input fuse_out, // also write this job's results into OBUF for the next layer
     // weight / activation load (valid/ready)
     input w_valid,
     output w_ready,
@@ -42,6 +45,8 @@ module TPU (
     logic wmem_en_c, wmem_en_w;
     logic [`AMEM_ADDR_W-1:0] ub_addr_w, ub_addr_r;
     logic ub_en_w, ub_en_r;
+    logic [`OBUF_ADDR_W-1:0] obuf_addr_w, obuf_addr_r;
+    logic obuf_en_w, obuf_en_r, act_sel;
     logic weight_valid, skew_en, comp_clr, csa_cw_valid, csa_act_valid;
     logic acc_clr;
     logic [`ARRAY_S-1:0] acc_wr_en;
@@ -60,6 +65,8 @@ module TPU (
     logic [`WMEM_DW-1:0] wmem_data_o;
     logic [`CW_BW-1:0] cmem_cweight_o;
     logic [`AMEM_DW-1:0] ub_data_o;
+    logic [`AMEM_DW-1:0] obuf_data_o;
+    logic [`AMEM_DW-1:0] act_row;
     logic [`A_BW-1:0] ds_activation_o;
     logic [`A_BW-1:0] ds_activation_cout_o;
     logic [`ARRAY_S-1:0] ds_cout_valid_o;
@@ -71,10 +78,10 @@ module TPU (
     logic [`WMEM_ADDR_W-1:0] wmem_addr_w;
     assign wmem_addr_w = (wmem_en_w) ? wpu_wmem_addr_o : wmem_addr;
 
-    // UB write data : external activation during load, result write-back during OUT
-    // (r_valid is high only in OUT, so it doubles as the write-back select)
-    logic [`A_BW-1:0] ub_wdata;
-    assign ub_wdata = (r_valid)? r_data : a_data;
+    // activation source : streamed host data (UB) or the previous layer's result
+    // still sitting in OBUF. Both memories have the same 1-cycle read latency and
+    // act_sel is descriptor-held, so the mux never moves inside a job.
+    assign act_row = (act_sel) ? obuf_data_o : ub_data_o;
 
     // requant constants held by TSC (latched with the descriptor there), driven to OP
     logic [`QMULT_W-1:0] qmult_q;
@@ -91,6 +98,8 @@ module TPU (
         .dim_n(dim_n),
         .quant_mult(quant_mult),
         .quant_shift(quant_shift),
+        .fuse_in(fuse_in),
+        .fuse_out(fuse_out),
         .busy(busy),
         .done(done),
         .w_valid(w_valid),
@@ -107,6 +116,11 @@ module TPU (
         .ub_addr_r(ub_addr_r),
         .ub_en_w(ub_en_w),
         .ub_en_r(ub_en_r),
+        .obuf_addr_w(obuf_addr_w),
+        .obuf_addr_r(obuf_addr_r),
+        .obuf_en_w(obuf_en_w),
+        .obuf_en_r(obuf_en_r),
+        .act_sel(act_sel),
         .weight_valid(weight_valid),
         .skew_en(skew_en),
         .comp_clr(comp_clr),
@@ -151,19 +165,30 @@ module TPU (
         .cweight_o(cmem_cweight_o));
 
     // ================= activation path =================
-    UB_Wrapper u_UB_Wrapper(
+    // UB : 2 x 16-row streaming window (host activation)
+    UB_Wrapper #(.DEPTH(`AMEM_D)) u_UB_Wrapper(
         .clk(clk),
-        .data_i(ub_wdata),
+        .data_i(a_data),
         .addr_w(ub_addr_w),
         .addr_r(ub_addr_r),
         .en_w(ub_en_w),
         .en_r(ub_en_r),
         .data_o(ub_data_o));
 
+    // OBUF : 128-row layer-fusion buffer (this layer writes, next layer reads)
+    UB_Wrapper #(.DEPTH(`OBUF_D)) u_OBUF_Wrapper(
+        .clk(clk),
+        .data_i(r_data),
+        .addr_w(obuf_addr_w),
+        .addr_r(obuf_addr_r),
+        .en_w(obuf_en_w),
+        .en_r(obuf_en_r),
+        .data_o(obuf_data_o));
+
     Data_Setup u_Data_Setup(
         .clk(clk),
         .rst_n(rst_n),
-        .activation_i(ub_data_o),
+        .activation_i(act_row),
         .skew_en(skew_en),
         .comp_clr(comp_clr),
         .cout_valid(wpu_cout_valid),
@@ -211,5 +236,33 @@ module TPU (
         .quant_shift(qshift_q),
         .acc_i(acc_o),
         .data_o(r_data));
+
+    // X-propagation checkpoints for RTL simulation.  The normal test target
+    // already enables +define+SVA; synthesis does not see this block.
+    `ifdef SVA
+        CHECK_W_INPUT_KNOWN: assert property (@(posedge clk) disable iff(!rst_n)
+            wpu_wmem_w |-> !$isunknown(w_data))
+        else $error("[XTRACE] raw weight input is unknown on an accepted load beat");
+
+        CHECK_WMEM_WRITE_KNOWN: assert property (@(posedge clk) disable iff(!rst_n)
+            (wmem_en_c && wmem_en_w) |-> !$isunknown({wmem_addr_w, wpu_rweight}))
+        else $error("[XTRACE] WMEM write address or encoded weight is unknown");
+
+        CHECK_WMEM_READ_KNOWN: assert property (@(posedge clk) disable iff(!rst_n)
+            weight_valid |-> !$isunknown(wmem_data_o))
+        else $error("[XTRACE] WMEM read data is unknown while preloading weights");
+
+        CHECK_ACT_READ_KNOWN: assert property (@(posedge clk) disable iff(!rst_n)
+            skew_en |-> !$isunknown(act_row))
+        else $error("[XTRACE] activation read data is unknown while feeding RSA");
+
+        CHECK_RSA_PSUM_KNOWN: assert property (@(posedge clk) disable iff(!rst_n)
+            (|acc_wr_en) |-> !$isunknown(rsa_psum))
+        else $error("[XTRACE] RSA psum is unknown when ACC writes it");
+
+        CHECK_ACC_READ_KNOWN: assert property (@(posedge clk) disable iff(!rst_n)
+            r_valid |-> !$isunknown(acc_o))
+        else $error("[XTRACE] ACC read data is unknown at output");
+    `endif
 
 endmodule

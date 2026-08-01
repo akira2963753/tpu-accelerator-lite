@@ -63,7 +63,6 @@ module WPU (
                 cout_valid <= 0;
                 crow <= 0;
                 wmem_addr_o <= 0;
-                cout_valid <= 0; 
             end
         end
     end

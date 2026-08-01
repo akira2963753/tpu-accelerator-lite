@@ -8,7 +8,6 @@
 *
 ******************************************************************************/
 
-// According to Reduced Processing Unit Hardware
 module RPE(
     input clk,
     input rst_n,

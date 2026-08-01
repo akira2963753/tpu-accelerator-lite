@@ -46,7 +46,7 @@ module TESTBED();
     logic [`W_BW-1:0] rweight;
     logic [`CW_BW-1:0] cweight;
     logic [`ARRAY_S-1:0] cout_valid;
-    logic [`WMEM_ADDR_W-1:0] crow;
+    logic [`ROW_IDX_W-1:0] crow;
     logic [`WMEM_ADDR_W-1:0] wmem_addr_o;
 
     PATTERN u_pattern (

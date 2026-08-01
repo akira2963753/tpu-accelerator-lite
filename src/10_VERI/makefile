@@ -1,15 +1,20 @@
 #======================================================
 #         Design Flow MakeFile (Author: Marco)         
 #======================================================
-.PHONY: vcs_rtl vcs_gate syn
+# Shared by every per-block env under 10_VERI/<BLOCK>/.
+# Run from the block's own 00_TESTBED / 02_SYN / 03_GATE :
+#     make -f ../../makefile vcs_rtl
+# syn_tcl is overridable per block :  make -f ../../makefile syn syn_tcl=syn90.tcl
+#======================================================
+.PHONY: vcs_rtl vcs_gate syn clean
 
 #======================================================
 #              Set your desired file names
 #======================================================
-top_design=Handshaker
+top_design=TPU
 source_file="file.f"
 TIMESCALE="-timescale=1ns/1ps"
-syn_tcl="syn90.tcl"
+syn_tcl="syn16.tcl"
 syn_log="syn.log"
 
 #======================================================
@@ -47,3 +52,6 @@ vcs_gate:
 
 syn:
 	${DC_shell}
+
+clean:
+	rm -rf simv* csrc *.daidir ucli.key vc_hdrs.h novas* verdiLog *.fsdb *.vpd

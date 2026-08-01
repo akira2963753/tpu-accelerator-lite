@@ -31,10 +31,15 @@ module TESTBED();
     //=============================================================
     // ------------------------- FSDB Dump ------------------------
     //=============================================================
-    initial begin
-        $fsdbDumpfile("TESTBED.fsdb");
-        $fsdbDumpvars(0, TESTBED, "+mda");
-    end
+    // Gated : the full suite runs ~3.2M cycles (26M with --big) and dumping the
+    // whole hierarchy with +mda (ACC 16x16xACC_W, Data_Setup 16x16 skew) writes
+    // tens of GB. Build with +define+DUMP only when you actually need waves.
+    `ifdef DUMP
+        initial begin
+            $fsdbDumpfile("TESTBED.fsdb");
+            $fsdbDumpvars(0, TESTBED, "+mda");
+        end
+    `endif
 
     //=============================================================
     // --------------------- Design & Pattern ---------------------
@@ -46,6 +51,7 @@ module TESTBED();
     logic [`N_W-1:0] dim_n;
     logic [`QMULT_W-1:0] quant_mult;
     logic [`QSHIFT_W-1:0] quant_shift;
+    logic fuse_in, fuse_out;
     logic w_valid, w_ready;
     logic [`W_RAW_BW-1:0] w_data;
     logic a_valid, a_ready;
@@ -64,6 +70,8 @@ module TESTBED();
         .dim_n(dim_n),
         .quant_mult(quant_mult),
         .quant_shift(quant_shift),
+        .fuse_in(fuse_in),
+        .fuse_out(fuse_out),
         .w_valid(w_valid),
         .w_ready(w_ready),
         .w_data(w_data),
@@ -87,6 +95,8 @@ module TESTBED();
         .dim_n(dim_n),
         .quant_mult(quant_mult),
         .quant_shift(quant_shift),
+        .fuse_in(fuse_in),
+        .fuse_out(fuse_out),
         .w_valid(w_valid),
         .w_ready(w_ready),
         .w_data(w_data),

@@ -1,1 +1,1 @@
-make -f ./00_TESTBED/makefile vcs_rtl
+make -f ../00_TESTBED/makefile vcs_rtl

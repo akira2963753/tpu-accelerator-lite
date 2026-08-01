@@ -28,8 +28,10 @@ module Data_Setup (
 
     always_ff @(posedge clk or negedge rst_n) begin
         if(!rst_n) begin
+            // k starts at 0 : skew[r][0] is the live input stage and skew[0][0] IS
+            // activation_o lane 0, so leaving it un-reset drives X into the array.
             for(int r = 0; r < `ARRAY_S; r++)
-                for(int k = 1; k <= r; k++)
+                for(int k = 0; k <= r; k++)
                     skew[r][k] <= 0;
         end
         else if(skew_en) begin

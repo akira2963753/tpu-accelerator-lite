@@ -21,7 +21,7 @@ module PATTERN(
     input [`W_BW-1:0] rweight,
     input [`CW_BW-1:0] cweight,
     input [`ARRAY_S-1:0] cout_valid,
-    input [`WMEM_ADDR_W-1:0] crow,
+    input [`ROW_IDX_W-1:0] crow, // row within the 16-row tile, NOT a WMEM address
     input [`WMEM_ADDR_W-1:0] wmem_addr_o
 );
 
