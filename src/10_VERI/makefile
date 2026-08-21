@@ -1,10 +1,8 @@
 #======================================================
 #         Design Flow MakeFile (Author: Marco)         
 #======================================================
-# Shared by every per-block env under 10_VERI/<BLOCK>/.
-# Run from the block's own 00_TESTBED / 02_SYN / 03_GATE :
-#     make -f ../../makefile vcs_rtl
-# syn_tcl is overridable per block :  make -f ../../makefile syn syn_tcl=syn90.tcl
+# Shared standalone verification flow.
+# Run from the block directory.
 #======================================================
 .PHONY: vcs_rtl vcs_gate syn clean
 

@@ -1,245 +1,267 @@
 #!/usr/bin/env python3
-# ---------------------------------------------------------------------------
-# gen_suite.py : table-driven verification-suite generator for the TPU top.
-#
-# Edit TEST_TABLE below (the single source of truth), then run once :
-#     python3 python/gen_suite.py           # default tier (fast, ~3.5M cycles)
-#     python3 python/gen_suite.py --big     # + the 1024^3 case (~22M cycles)
-# It emits, for every row :
-#     pattern/tNN_weight.dat  tNN_activation.dat  tNN_golden.dat
-# plus a manifest the testbench includes :
-#     test_suite.svh          (NUM_TESTS + per-test param arrays)
-#     suite_summary.txt       (human-readable overview)
-#
-# The .dat files hold only UNIQUE data ; PATTERN.sv replays them in the order
-# the DUT asks for (weight repeats per mt, activation repeats per nt). See the
-# index maps at the top of tpu_gen.py.
-#
-# PATTERN.sv loops over all rows, drives each job, and self-checks r_data vs
-# golden. Rows with overflow=True are CMEM-overflow corners : the runner expects
-# a mismatch for them (reverse judged), every other row must match exactly.
-# ---------------------------------------------------------------------------
+"""Generate the primary directed verification suite."""
+
 import argparse
-import glob
 import os
 import random
 
+import tpu_command as tc
 import tpu_gen as tg
 
-ARRAY_S = tg.ARRAY_S
-W_W, A_W = tg.W_W, tg.A_W
 
-# ---- must track define.vh ----
-M_MAX, N_MAX, K_MAX = 1024, 1024, 4096
-OBUF_D = 128                       # layer-fusion buffer depth
-OBUF_TILES = OBUF_D // ARRAY_S     # = 8
+def gemm_spec(name, m_dim, k_dim, n_dim, *, seed, activation_mode="random",
+              weight_mode="msr", qmult=1, qshift=None, readback=False,
+              r_stall=False):
+    return {
+        "kind": "gemm",
+        "name": name,
+        "M": m_dim,
+        "K": k_dim,
+        "N": n_dim,
+        "seed": seed,
+        "activation_mode": activation_mode,
+        "weight_mode": weight_mode,
+        "qmult": qmult,
+        "qshift": qshift,
+        "readback": readback,
+        "r_stall": r_stall,
+    }
 
 
-def T(name, M, K, N, nm4=0, qmult=1, qshift=0, seed=1, new_seq=1, overflow=False,
-      fuse_in=False, fuse_out=False, big=False):
-    return dict(name=name, M=M, K=K, N=N, nm4=nm4, qmult=qmult, qshift=qshift,
-                seed=seed, new_seq=new_seq, overflow=overflow,
-                fuse_in=fuse_in, fuse_out=fuse_out, big=big)
-
-
-# ---------------------------------------------------------------------------
-# TEST_TABLE : one row = one matmul job. Fields :
-#   M,K,N     dims (multiples of 16 ; M,N <= 1024 ; K <= 4096)
-#   nm4       Non-MSR-4 tiles / column      qmult   requant M0
-#   qshift    requant >>n (None = auto)     seed    reproducible RNG seed
-#   new_seq   1 = reset DUT before job ; 0 = back-to-back (no reset)
-#   overflow  True = break CMEM limit on purpose (runner expects a mismatch)
-#   fuse_out  True = also write results into OBUF   (needs M<=16, N<=128)
-#   fuse_in   True = read activation from OBUF      (needs M<=16, K<=128)
-#             a fuse_in row must directly follow its fuse_out producer and take
-#             K == producer's N, M == producer's M.
-#   big       True = only emitted with --big (long-running)
-# ---------------------------------------------------------------------------
 TEST_TABLE = [
-    # ---- basic main path (no compensation, identity requant) ----
-    T("basic_16",          16,   16,   16, seed=42),
-    T("basic_32",          32,   32,   32, seed=43),
-    T("basic_128",        128,  128,  128, seed=44),
-    T("basic_16x128x16",   16,  128,   16, seed=45),
-    T("basic_128x16x128", 128,   16,  128, seed=46),
-    T("basic_64x48x32",    64,   48,   32, seed=47),
-    # ---- large K : UB is a streaming window now, K is bounded by ACC_W only ----
-    T("bigk_512",          16,  512,   16, qshift=None, seed=48),
-    T("bigk_1024",         32, 1024,   32, qshift=None, seed=49),
-    T("bigk_4096",         16, 4096,   16, qshift=None, seed=50),
-    # ---- large M / N : free dimensions (descriptor port width only) ----
-    T("bigm_1024",       1024,   16,   16, seed=51),
-    T("bign_1024",         16,   16, 1024, seed=52),
-    T("bigmn_512",        512,   16,  512, seed=53),
-    # ---- compensation : Non-MSR-4, legal (<= 1 per 16-row tile per column) ----
-    T("comp_16",           16,   16,   16, nm4=1, seed=54),
-    T("comp_64",           64,   64,   64, nm4=1, seed=55),
-    T("comp_bigk",         32,  512,   32, nm4=2, qshift=None, seed=56),
-    # ---- CMEM-overflow corner : 2 Non-MSR-4 in one tile -> expected mismatch ----
-    T("comp_ovf_16",       16,   16,   16, nm4=1, seed=57, overflow=True),
-    # ---- requant : non-trivial scale / saturation / ReLU / >31 shift ----
-    T("rq_scale_16",       16,   16,   16, qmult=13,     qshift=7,  seed=62),
-    T("rq_sat_16",         16,   16,   16, qmult=1000,   qshift=0,  seed=63),
-    T("rq_relu_16",        16,   16,   16, qmult=5,      qshift=4,  seed=64),
-    T("rq_shift32",        16, 4096,   16, qmult=131071, qshift=32, seed=65),
-    # ---- consecutive jobs : back-to-back, no reset (tests re-entry) ----
-    T("consec_a",          32,   32,   32, seed=72, new_seq=1),
-    T("consec_b",          16,   64,   48, seed=73, new_seq=0),
-    T("consec_c",          48,   16,   16, seed=74, new_seq=0),
-    # ---- on-chip layer fusion : producer writes OBUF, consumer reads it ----
-    T("fuse_src",          16,   16,   32, qshift=7, seed=80, fuse_out=True),
-    T("fuse_dst",          16,   32,   16, qshift=7, seed=81, new_seq=0, fuse_in=True),
-    # ---- long-running (only with --big) ----
-    T("big_512",          512,  512,  512, qshift=None, seed=90),
-    T("big_1024",        1024, 1024, 1024, qshift=None, seed=91, big=True),
+    {
+        "kind": "ub",
+        "name": "ub_load_read",
+        "M": 32,
+        "K": 32,
+        "N": 32,
+        "seed": 10,
+        "r_stall": False,
+    },
+    gemm_spec("gemm_basic", 32, 32, 32, seed=20),
+    gemm_spec(
+        "gemm_signed", 32, 32, 32, seed=21,
+        activation_mode="ramp", weight_mode="mixed",
+    ),
+    gemm_spec("gemm_multi_k", 32, 64, 32, seed=22),
+    gemm_spec("weight_reuse", 64, 32, 32, seed=23),
+    gemm_spec(
+        "multi_tile_slot", 64, 64, 64, seed=24,
+        activation_mode="ramp", weight_mode="mixed",
+    ),
+    gemm_spec(
+        "requant_relu", 32, 32, 32, seed=25,
+        activation_mode="ramp", weight_mode="mixed", qmult=3,
+    ),
+    gemm_spec("store_read_ub", 32, 32, 32, seed=26, readback=True),
+    gemm_spec("ready_stall", 32, 32, 32, seed=27, r_stall=True),
 ]
 
-# ---- random cases (reproducible via meta-seed ; qshift auto-tuned) ----
-_rng = random.Random(2026)
-_SIZES = [16, 32, 48, 64, 96, 128]
-_KSIZES = [16, 32, 64, 128, 256, 512]
-for _i in range(6):
-    TEST_TABLE.append(T("rand_%d" % _i,
-                        _rng.choice(_SIZES), _rng.choice(_KSIZES), _rng.choice(_SIZES),
-                        nm4=_rng.choice([0, 1]),
-                        qmult=_rng.randint(1, 64), qshift=None,
-                        seed=100 + _i, new_seq=1))
+
+def _gemm_case(spec):
+    rng = random.Random(spec["seed"])
+    activation = tg.generate_activation(
+        rng, spec["M"], spec["K"], spec["activation_mode"]
+    )
+    weight = tg.generate_weight(
+        rng, spec["K"], spec["N"], spec["weight_mode"]
+    )
+    accumulator = tg.matmul_acc_model(activation, weight)
+    qshift = spec["qshift"]
+    if qshift is None:
+        qshift = tg.auto_qshift(accumulator, spec["qmult"])
+    output = [
+        [tg.op_model(value, spec["qmult"], qshift) for value in row]
+        for row in accumulator
+    ]
+
+    commands = tc.compile_gemm_trace(
+        spec["M"], spec["K"], spec["N"],
+        spec["qmult"], qshift,
+        readback=spec["readback"],
+    )
+    weight_rows = []
+    activation_rows = []
+    golden_rows = []
+    for command in commands:
+        if command.opcode == tc.CMD_OP_LOAD_W:
+            weight_rows.extend(tg.pack_weight_tile(
+                weight, command.kt, command.nt
+            ))
+        elif command.opcode == tc.CMD_OP_LOAD_A:
+            activation_rows.extend(tg.pack_activation_tile(
+                activation, command.mt, command.kt
+            ))
+        elif command.opcode in (tc.CMD_OP_STORE_C, tc.CMD_OP_READ_UB):
+            golden_rows.extend(tg.pack_output_tile(
+                output, command.mt, command.nt
+            ))
+
+    result = dict(spec)
+    result.update({
+        "qshift": qshift,
+        "commands": commands,
+        "weight_rows": weight_rows,
+        "activation_rows": activation_rows,
+        "golden_rows": golden_rows,
+        "positive_acc": sum(value > 0 for row in accumulator for value in row),
+        "zero_output": sum(value == 0 for row in output for value in row),
+        "sat_output": sum(value == tg.SAT_MAX for row in output for value in row),
+    })
+    return result
 
 
-def validate(t, row, prev):
-    n = row["name"]
-    for d in ("M", "K", "N"):
-        assert row[d] % ARRAY_S == 0, "%s : %s must be a multiple of %d" % (n, d, ARRAY_S)
-    assert 0 < row["M"] <= M_MAX, "%s : M must be in (0,%d]" % (n, M_MAX)
-    assert 0 < row["N"] <= N_MAX, "%s : N must be in (0,%d]" % (n, N_MAX)
-    assert 0 < row["K"] <= K_MAX, "%s : K must be in (0,%d]" % (n, K_MAX)
-    assert row["qshift"] is None or row["qshift"] >= 0, "%s : qshift must be >= 0" % n
-    assert 0 <= row["qmult"] < (1 << 17), "%s : qmult must fit signed QMULT_W" % n
-    if not row["overflow"] and row["nm4"] > 0:
-        assert row["nm4"] <= row["K"] // ARRAY_S, \
-            "%s : nm4 (%d) exceeds tile count (%d)" % (n, row["nm4"], row["K"] // ARRAY_S)
-    # ---- fusion legality (OBUF is 8 x 16 rows and the write address ignores mt) ----
-    if row["fuse_out"]:
-        assert row["M"] <= ARRAY_S, "%s : fuse_out needs M <= %d" % (n, ARRAY_S)
-        assert row["N"] <= OBUF_D, "%s : fuse_out needs N <= %d" % (n, OBUF_D)
-    if row["fuse_in"]:
-        assert row["M"] <= ARRAY_S, "%s : fuse_in needs M <= %d" % (n, ARRAY_S)
-        assert row["K"] <= OBUF_D, "%s : fuse_in needs K <= %d" % (n, OBUF_D)
-        assert prev is not None and prev["fuse_out"], \
-            "%s : fuse_in must directly follow a fuse_out row" % n
-        assert row["K"] == prev["N"], \
-            "%s : fuse_in K (%d) must equal producer N (%d)" % (n, row["K"], prev["N"])
-        assert row["M"] == prev["M"], \
-            "%s : fuse_in M (%d) must equal producer M (%d)" % (n, row["M"], prev["M"])
-        assert row["new_seq"] == 0, "%s : fuse_in must not reset the DUT" % n
+def _ub_case(spec):
+    rng = random.Random(spec["seed"])
+    activation = tg.generate_activation(rng, 32, 32, "ramp")
+    activation_rows = tg.pack_activation_tile(activation, 0, 0)
+    commands = tc.compile_ub_read_trace(slot=7)
+    result = dict(spec)
+    result.update({
+        "qmult": 1,
+        "qshift": 0,
+        "commands": commands,
+        "weight_rows": [],
+        "activation_rows": activation_rows,
+        "golden_rows": tg.expand_ub_rows(activation_rows),
+        "positive_acc": 0,
+        "zero_output": 0,
+        "sat_output": 0,
+    })
+    return result
 
 
-def _arr(name, vals):
-    return "    localparam int %s [NUM_TESTS] = '{%s};\n" % (name, ", ".join(str(v) for v in vals))
+def build_suite():
+    cases = []
+    for spec in TEST_TABLE:
+        case = _ub_case(spec) if spec["kind"] == "ub" else _gemm_case(spec)
+        validate_case(case)
+        cases.append(case)
+    return cases
 
 
-def _emit_svh(path, metas):
-    mw = max(m["w_rows"] for m in metas)
-    ma = max(m["a_rows"] for m in metas)
-    mr = max(m["r_rows"] for m in metas)
-    with open(path, "w", newline="\n") as f:
-        f.write("// AUTO-GENERATED by gen_suite.py -- do not edit by hand.\n")
-        f.write("// Regenerate : python3 python/gen_suite.py [--big]\n\n")
-        f.write("    localparam int NUM_TESTS  = %d;\n" % len(metas))
-        f.write("    // .dat file lengths (unique data ; PATTERN replays them)\n")
-        f.write("    localparam int MAX_W_ROWS = %d;\n" % mw)
-        f.write("    localparam int MAX_A_ROWS = %d;\n" % ma)
-        f.write("    localparam int MAX_R_ROWS = %d;\n" % mr)
-        f.write(_arr("TEST_M", [m["M"] for m in metas]))
-        f.write(_arr("TEST_K", [m["K"] for m in metas]))
-        f.write(_arr("TEST_N", [m["N"] for m in metas]))
-        f.write(_arr("TEST_QMULT", [m["qmult"] for m in metas]))
-        f.write(_arr("TEST_QSHIFT", [m["qshift"] for m in metas]))
-        f.write(_arr("TEST_NEWSEQ", [m["new_seq"] for m in metas]))
-        f.write(_arr("TEST_XMISS", [1 if m["overflow"] else 0 for m in metas]))  # 1 = expect mismatch
-        f.write(_arr("TEST_FIN", [1 if m["fuse_in"] else 0 for m in metas]))
-        f.write(_arr("TEST_FOUT", [1 if m["fuse_out"] else 0 for m in metas]))
-        names = ", ".join('"%s"' % m["name"] for m in metas)
-        f.write("    localparam string TEST_NAME [NUM_TESTS] = '{%s};\n" % names)
+def validate_case(case):
+    load_w = sum(command.opcode == tc.CMD_OP_LOAD_W for command in case["commands"])
+    load_a = sum(command.opcode == tc.CMD_OP_LOAD_A for command in case["commands"])
+    result_cmds = sum(
+        command.opcode in (tc.CMD_OP_STORE_C, tc.CMD_OP_READ_UB)
+        for command in case["commands"]
+    )
+    assert len(case["weight_rows"]) == load_w * tg.ARRAY_S
+    assert len(case["activation_rows"]) == load_a * tg.ARRAY_S
+    assert len(case["golden_rows"]) == result_cmds * tg.ARRAY_S
+
+    for command in case["commands"]:
+        decoded = tc.decode_descriptor(command.word)
+        assert decoded["opcode"] == command.opcode
+        assert decoded["mt"] == command.mt
+        assert decoded["kt"] == command.kt
+        assert decoded["nt"] == command.nt
+        assert decoded["w_slot"] == command.w_slot
+        assert decoded["src_slot"] == command.src_slot
+        assert decoded["dst_slot"] == command.dst_slot
+        assert command.word >> tc.CMD_DEFINED_W == 0
+        assert tc.field(command.word, 5, 3) == 0
 
 
-def _cycles(m):
-    """rough DUT cycle estimate : per k-tile 17 LOADING + 17 PRELOAD + 52 CAL."""
-    per_tile = 17 + 17 + (ARRAY_S + 2 * ARRAY_S + 4)
-    return m["MT"] * m["NT"] * (m["KT"] * per_tile + ARRAY_S)
+def _sv_int_array(name, values):
+    return "    localparam int %-15s [NUM_TESTS] = '{%s};\n" % (
+        name, ", ".join(str(value) for value in values)
+    )
 
 
-def _emit_summary(path, metas):
-    total = 0
-    with open(path, "w", newline="\n") as f:
-        f.write("TPU verification suite  (%d cases)\n" % len(metas))
-        f.write("=" * 100 + "\n")
-        f.write("%-3s %-18s %5s %5s %5s %4s %7s %6s %4s %4s %7s %7s %10s %-8s\n" %
-                ("id", "name", "M", "K", "N", "nm4", "qmult", "qshift", "seq",
-                 "fuse", "beats", "sat", "cycles", "expect"))
-        for t, m in enumerate(metas):
-            c = _cycles(m)
-            total += c
-            fuse = ("O" if m["fuse_out"] else "-") + ("I" if m["fuse_in"] else "-")
-            f.write("%-3d %-18s %5d %5d %5d %4d %7d %6d %4d %4s %7d %7d %10d %-8s\n" % (
-                t, m["name"], m["M"], m["K"], m["N"], m["non_msr4_per_col"],
-                m["qmult"], m["qshift"], m["new_seq"], fuse, m["r_beats"],
-                m["saturated"], c, "MISMATCH" if m["overflow"] else "pass"))
-        f.write("=" * 100 + "\n")
-        f.write("total estimated DUT cycles : %d  (~%.1f ms sim time @ 10ns)\n"
-                % (total, total * 10 / 1e6))
-    return total
+def write_manifest(path, cases):
+    max_cmd = max(len(case["commands"]) for case in cases)
+    max_w = max(len(case["weight_rows"]) for case in cases)
+    max_a = max(len(case["activation_rows"]) for case in cases)
+    max_r = max(len(case["golden_rows"]) for case in cases)
+    with open(path, "w", newline="\n") as manifest:
+        manifest.write("// Auto-generated by python/gen_suite.py.\n\n")
+        manifest.write("    localparam int NUM_TESTS     = %d;\n" % len(cases))
+        manifest.write("    localparam int MAX_CMD_COUNT = %d;\n" % max_cmd)
+        manifest.write("    localparam int MAX_W_ROWS    = %d;\n" % max_w)
+        manifest.write("    localparam int MAX_A_ROWS    = %d;\n" % max_a)
+        manifest.write("    localparam int MAX_R_ROWS    = %d;\n\n" % max_r)
+        manifest.write(_sv_int_array("TEST_M", [case["M"] for case in cases]))
+        manifest.write(_sv_int_array("TEST_K", [case["K"] for case in cases]))
+        manifest.write(_sv_int_array("TEST_N", [case["N"] for case in cases]))
+        manifest.write(_sv_int_array(
+            "TEST_CMD_COUNT", [len(case["commands"]) for case in cases]
+        ))
+        manifest.write(_sv_int_array(
+            "TEST_W_ROWS", [len(case["weight_rows"]) for case in cases]
+        ))
+        manifest.write(_sv_int_array(
+            "TEST_A_ROWS", [len(case["activation_rows"]) for case in cases]
+        ))
+        manifest.write(_sv_int_array(
+            "TEST_R_ROWS", [len(case["golden_rows"]) for case in cases]
+        ))
+        manifest.write(_sv_int_array(
+            "TEST_RSTALL", [int(case["r_stall"]) for case in cases]
+        ))
+        names = ", ".join('"%s"' % case["name"] for case in cases)
+        manifest.write(
+            "    localparam string TEST_NAME [NUM_TESTS] = '{%s};\n" % names
+        )
+
+
+def write_summary(path, cases):
+    with open(path, "w", newline="\n") as summary:
+        summary.write("TPU primary verification suite\n")
+        summary.write("=" * 96 + "\n")
+        summary.write(
+            "%-2s %-18s %5s %5s %5s %6s %6s %6s %6s %6s %6s\n" %
+            ("id", "name", "M", "K", "N", "qmult", "qshift",
+             "cmds", "wrows", "arows", "rrows")
+        )
+        for index, case in enumerate(cases):
+            summary.write(
+                "%-2d %-18s %5d %5d %5d %6d %6d %6d %6d %6d %6d\n" %
+                (index, case["name"], case["M"], case["K"], case["N"],
+                 case["qmult"], case["qshift"], len(case["commands"]),
+                 len(case["weight_rows"]), len(case["activation_rows"]),
+                 len(case["golden_rows"]))
+            )
+        summary.write("=" * 96 + "\n")
+
+
+def write_suite(root, cases):
+    pattern_dir = os.path.join(root, "pattern")
+    os.makedirs(pattern_dir, exist_ok=True)
+    for index, case in enumerate(cases):
+        prefix = os.path.join(pattern_dir, "t%02d_" % index)
+        tg.write_dat(
+            prefix + "command.dat",
+            [command.word for command in case["commands"]],
+            tc.CMD_DESC_W,
+        )
+        tg.write_dat(prefix + "weight.dat", case["weight_rows"], tg.W_W * tg.ARRAY_S)
+        tg.write_dat(prefix + "activation.dat", case["activation_rows"], tg.A_W * tg.ARRAY_S)
+        tg.write_dat(prefix + "golden.dat", case["golden_rows"], tg.R_W * tg.ARRAY_S)
+
+    write_manifest(os.path.join(root, "test_suite.svh"), cases)
+    write_summary(os.path.join(root, "suite_summary.txt"), cases)
 
 
 def main():
-    ap = argparse.ArgumentParser(description="TPU verification suite generator")
-    ap.add_argument("--big", action="store_true",
-                    help="also emit the long-running cases (1024^3, ~22M cycles)")
-    args = ap.parse_args()
+    parser = argparse.ArgumentParser(description="Generate primary TPU directed cases")
+    parser.add_argument("--outdir", default=None, help="00_TESTBED output directory")
+    args = parser.parse_args()
 
     here = os.path.dirname(os.path.abspath(__file__))
-    pat = os.path.normpath(os.path.join(here, "..", "pattern"))
-    svh = os.path.normpath(os.path.join(here, "..", "test_suite.svh"))
-    summ = os.path.normpath(os.path.join(here, "..", "suite_summary.txt"))
-    os.makedirs(pat, exist_ok=True)
+    root = args.outdir or os.path.normpath(os.path.join(here, ".."))
+    cases = build_suite()
+    write_suite(root, cases)
 
-    # drop stale tNN_*.dat from a previous (differently sized) suite
-    for old in glob.glob(os.path.join(pat, "t[0-9][0-9]_*.dat")):
-        os.remove(old)
-
-    table = [r for r in TEST_TABLE if args.big or not r["big"]]
-
-    metas = []
-    prev_out = None          # quantised output of the last fuse_out job
-    prev_row = None
-    for t, row in enumerate(table):
-        validate(t, row, prev_row)
-        A_in = prev_out if row["fuse_in"] else None
-        w_rows, a_rows, g_rows, meta, Cp = tg.gen_case(
-            row["M"], row["K"], row["N"], row["nm4"],
-            row["qmult"], row["qshift"], row["seed"], row["overflow"], A_in)
-        tg.write_dat(os.path.join(pat, "t%02d_weight.dat" % t), w_rows, W_W * ARRAY_S)
-        tg.write_dat(os.path.join(pat, "t%02d_activation.dat" % t), a_rows, A_W * ARRAY_S)
-        tg.write_dat(os.path.join(pat, "t%02d_golden.dat" % t), g_rows, A_W * ARRAY_S)
-        meta.update(name=row["name"], new_seq=row["new_seq"],
-                    fuse_in=row["fuse_in"], fuse_out=row["fuse_out"])
-        metas.append(meta)
-        prev_out = Cp if row["fuse_out"] else None
-        prev_row = row
-        print("  [%2d] %-18s M=%-5d K=%-5d N=%-5d qshift=%-2d rows w/a/g = %d/%d/%d"
-              % (t, meta["name"], meta["M"], meta["K"], meta["N"], meta["qshift"],
-                 meta["w_rows"], meta["a_rows"], meta["r_rows"]))
-
-    _emit_svh(svh, metas)
-    total = _emit_summary(summ, metas)
-    print("=" * 64)
-    print("  generated %d cases -> %s" % (len(metas), pat))
-    print("  manifest  -> %s" % svh)
-    print("  summary   -> %s" % summ)
-    print("  estimated DUT cycles : %d (~%.1f ms @ 10ns)" % (total, total * 10 / 1e6))
-    if not any(r["big"] for r in table):
-        print("  (run with --big to add the 1024^3 case)")
-    print("=" * 64)
+    for index, case in enumerate(cases):
+        print(
+            "[%02d] %-18s M=%-3d K=%-3d N=%-3d cmds=%-3d rows=%d/%d/%d" %
+            (index, case["name"], case["M"], case["K"], case["N"],
+             len(case["commands"]), len(case["weight_rows"]),
+             len(case["activation_rows"]), len(case["golden_rows"]))
+        )
+    print("generated %d cases -> %s" % (len(cases), root))
 
 
 if __name__ == "__main__":

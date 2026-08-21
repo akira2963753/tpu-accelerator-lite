@@ -48,7 +48,7 @@ module PATTERN(
     // --------------------- Weight Generators --------------------
     //=============================================================
 
-    // MSR-4 : top nibble all-equal (0000 or 1111)
+    // MSR-4 weight
     function automatic [`W_W-1:0] rand_msr4();
         reg s;
         reg [3:0] lo;
@@ -59,7 +59,7 @@ module PATTERN(
         end
     endfunction
 
-    // Non-MSR-4 : top nibble mixed (reject until (&top)^(|top)==1)
+    // Non-MSR-4 weight
     function automatic [`W_W-1:0] rand_non_msr4();
         reg [`W_W-1:0] v;
         begin
@@ -73,7 +73,7 @@ module PATTERN(
     // ---------------------------- Tasks -------------------------
     //=============================================================
 
-    // Drive one row (16 lanes) then self-check the encoding identity
+    // Drive and check one row
     task automatic drive_and_check(input [`W_RAW_BW-1:0] wrow, input [`WMEM_ADDR_W-1:0] addr);
         int i;
         reg [`W_W-1:0] w;
@@ -90,10 +90,10 @@ module PATTERN(
                 weight_exp = {w[7:1], 1'b1};
 
                 if (cout_valid[i] === 1'b0)
-                    // MSR-4 : reduced alone reconstructs the weight
+                    // Reduced weight
                     recon = $signed({rweight[`RW_W*i +: `RW_W-1], 1'b1});
                 else
-                    // Non-MSR-4 : reduced (high nibble) + compensation (low part)
+                    // Reduced weight plus compensation
                     recon = $signed(rweight[`RW_W*i +: `RW_W-1]) * 16 + $signed({1'b0, cweight[`CW_W*i +: `CW_W-1], 1'b1});
 
                 if (recon !== weight_exp) begin
@@ -104,7 +104,7 @@ module PATTERN(
         end
     endtask
 
-    // Build one 16x16 tile : each column has exactly one Non-MSR-4 across its 16 rows
+    // Build one compensation tile
     task automatic run_tile();
         int r, c;
         int nz_row [0:`ARRAY_S-1];

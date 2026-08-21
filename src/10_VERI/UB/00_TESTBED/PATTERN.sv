@@ -61,7 +61,7 @@ module PATTERN(
     // ---------------------------- Tasks -------------------------
     //=============================================================
 
-    // Write Task (write port)
+    // Write
     task automatic mem_write(input [`AMEM_ADDR_W-1:0] a, input [`AMEM_DW-1:0] d);
         begin
             addr_w = a;
@@ -73,7 +73,7 @@ module PATTERN(
         end
     endtask
 
-    // Read Task (read port)
+    // Read
     task automatic mem_read_check(input [`AMEM_ADDR_W-1:0] a);
         begin
             addr_r = a;
@@ -85,22 +85,22 @@ module PATTERN(
         end
     endtask
 
-    // Phase 4 check : en_w=0 must inhibit a write. Write a known value, attempt a
+    // Check write disable.
     task automatic en_w_disable_check(input [`AMEM_ADDR_W-1:0] a);
         logic [`AMEM_DW-1:0] known;
         begin
-            // (1) known value in (en_w=1)
+            // Write known data.
             known = rand_data();
             mem_write(a, known);
 
-            // (2) disabled write with different data (en_w=0) -> must be ignored
+            // Attempt disabled write.
             addr_w = a;
             data_i = ~known;
             en_w = 0;
             en_r = 0;
             @(negedge clk);
 
-            // (3) read back (en_r=1) -> memory must still hold 'known'
+            // Check preserved data.
             addr_r = a;
             en_r = 1;
             en_w = 0;
@@ -110,7 +110,7 @@ module PATTERN(
         end
     endtask
 
-    // Phase 5 driver : dual-port concurrency. Read port runs every cycle (en_r=1),
+    // Check dual-port concurrency.
     task automatic dual_port_stream();
         logic [`AMEM_DW-1:0] exp_r;
         int aw, ar;
@@ -119,21 +119,19 @@ module PATTERN(
         begin
             en_r = 1;
             for (int k = 0; k < `TEST_NUM; k++) begin
-                // check the read launched in the previous cycle (skip the 1st)
+                // Check previous read.
                 if (k > 0) begin
                     CHECK_DUAL: assert (data_o === exp_r)
                     else $fatal(1, "[ERROR] : dual-port read exp=%028h got=%028h", exp_r, data_o);
                 end
 
-                // drive this cycle's write / read stimulus
+                // Drive current read/write.
                 aw = $urandom_range(0, `AMEM_D-1);
                 ar = $urandom_range(0, `AMEM_D-1);
                 d = rand_data();
                 we = $urandom_range(0, 1);
 
-                // two-port macro forbids read & write on the SAME address at the same
-                // edge (electrical contention -> Q=X). A correct datapath never issues
-                // it, so when a write fires, keep the read address off the write address.
+                // Avoid same-address read/write.
                 if (we && ar == aw) ar = (aw + 1) % `AMEM_D;
 
                 addr_w = aw[`AMEM_ADDR_W-1:0];
@@ -141,13 +139,13 @@ module PATTERN(
                 data_i = d;
                 en_w = we;
 
-                // read hits a different address than the write -> plain old memory value
+                // Read a different address.
                 exp_r = gold[ar];
                 if (we) gold[aw] = d;
                 @(negedge clk);
             end
 
-            // drain : check the last launched read
+            // Check final read.
             CHECK_DUAL_END: assert (data_o === exp_r)
             else $fatal(1, "[ERROR] : dual-port read exp=%028h got=%028h", exp_r, data_o);
             en_w = 0;
@@ -175,7 +173,7 @@ module PATTERN(
     //=============================================================
     initial begin
         init_dut();
-        // Phase 1 : write sweep over every address (covers all banks), then read sweep
+        // Write/read sweep
         veri_phase = PHASE1;
         for (int t = 0; t < `TEST_NUM; t++) begin
             for (int a = 0; a < `AMEM_D; a++) mem_write(a[`AMEM_ADDR_W-1:0], rand_data());
@@ -183,7 +181,7 @@ module PATTERN(
         end
         $display("Phase 1 Pass.");
 
-        // Phase 2 : random read/write mix
+        // Random read/write
         veri_phase = PHASE2;
         for (int t = 0; t < `TEST_NUM; t++) begin
             int a = $urandom_range(0, `AMEM_D-1);
@@ -192,7 +190,7 @@ module PATTERN(
         end
         $display("Phase 2 Pass.");
 
-        // Phase 3 : write-then-read turnaround (write addr A, immediately read A back)
+        // Write/read turnaround
         veri_phase = PHASE3;
         for (int t = 0; t < `TEST_NUM; t++) begin
             for (int a = 0; a < `AMEM_D; a++) begin
@@ -202,13 +200,13 @@ module PATTERN(
         end
         $display("Phase 3 Pass.");
 
-        // Phase 4 : en_w disable -> a write issued with en_w=0 must NOT modify memory.
+        // Write disable
         veri_phase = PHASE4;
         for (int t = 0; t < `TEST_NUM; t++)
             for (int a = 0; a < `AMEM_D; a++) en_w_disable_check(a[`AMEM_ADDR_W-1:0]);
         $display("Phase 4 Pass.");
 
-        // Phase 5 : dual-port concurrency -> random write + continuous read (en_r=1).
+        // Dual-port concurrency
         veri_phase = PHASE5;
         dual_port_stream();
         $display("Phase 5 Pass.");

@@ -55,7 +55,7 @@ module PATTERN(
     // ---------------------------- Tasks -------------------------
     //=============================================================
 
-    // Weight-stationary Pre-load
+    // Preload weights
     task automatic load_weight(input int p);
         int c;
         begin
@@ -69,7 +69,7 @@ module PATTERN(
         end
     endtask
 
-    // Activation Load
+    // Load activations
     task automatic run_pattern(input int p);
         int cyc, r, c, m;
         reg [`A_BW-1:0] act_bus;

@@ -11,95 +11,80 @@
 module TPU (
     input clk,
     input rst_n,
-    // job descriptor + start handshake
+
     input cmd_valid,
     output cmd_ready,
-    input [`M_W-1:0] dim_m,
-    input [`K_W-1:0] dim_k,
-    input [`N_W-1:0] dim_n,
-    // per-tensor requant constants (latched with the descriptor)
-    input [`QMULT_W-1:0] quant_mult,
-    input [`QSHIFT_W-1:0] quant_shift,
-    // on-chip layer fusion (latched with the descriptor)
-    input fuse_in,  // activation comes from OBUF (previous layer) : no host a_data
-    input fuse_out, // also write this job's results into OBUF for the next layer
-    // weight / activation load (valid/ready)
+    input [`CMD_DESC_W-1:0] cmd_desc,
+
     input w_valid,
     output w_ready,
-    input [`W_RAW_BW-1:0] w_data, // raw weight row
+    input [`W_RAW_BW-1:0] w_data,
     input a_valid,
     output a_ready,
-    input [`A_BW-1:0] a_data, // activation row
-    // result output (valid/ready)
+    input [`A_BW-1:0] a_data,
+
     output r_valid,
     input r_ready,
-    output [`A_BW-1:0] r_data,
-    // status
+    output [`R_BW-1:0] r_data,
+
     output busy,
     output done
 );
 
-    // ---- control (TSC -> datapath) ----
     logic wpu_wmem_w;
     logic [`WMEM_ADDR_W-1:0] wmem_addr;
-    logic wmem_en_c, wmem_en_w;
-    logic [`AMEM_ADDR_W-1:0] ub_addr_w, ub_addr_r;
-    logic ub_en_w, ub_en_r;
-    logic [`OBUF_ADDR_W-1:0] obuf_addr_w, obuf_addr_r;
-    logic obuf_en_w, obuf_en_r, act_sel;
-    logic weight_valid, skew_en, comp_clr, csa_cw_valid, csa_act_valid;
+    logic wmem_en, wmem_we;
+    logic [`UB_ADDR_W-1:0] ub_addr;
+    logic ub_en, ub_we;
+    logic r_from_ub;
+    logic weight_valid, skew_en, activation_valid;
     logic acc_clr;
     logic [`ARRAY_S-1:0] acc_wr_en;
     logic [`ARRAY_S*`ROW_IDX_W-1:0] acc_wr_row;
-    logic cacc_en;
-    logic [`ROW_IDX_W-1:0] cacc_wr_row;
     logic acc_rd_en;
     logic [`ROW_IDX_W-1:0] acc_rd_row;
 
-    // ---- datapath nets ----
     logic [`W_BW-1:0] wpu_rweight;
-    logic [`CW_BW-1:0] wpu_cweight;
-    logic [`ARRAY_S-1:0] wpu_cout_valid;
-    logic [`ROW_IDX_W-1:0] wpu_crow;
-    logic [`WMEM_ADDR_W-1:0] wpu_wmem_addr_o;
+    logic [`WMEM_ADDR_W-1:0] wpu_wmem_addr;
+    logic [`WMEM_ADDR_W-1:0] wmem_mem_addr;
     logic [`WMEM_DW-1:0] wmem_data_o;
-    logic [`CW_BW-1:0] cmem_cweight_o;
-    logic [`AMEM_DW-1:0] ub_data_o;
-    logic [`AMEM_DW-1:0] obuf_data_o;
-    logic [`AMEM_DW-1:0] act_row;
+    logic [`UB_DW-1:0] ub_data_i;
+    logic [`UB_DW-1:0] ub_data_o;
+    logic [`A_BW-1:0] activation_row;
     logic [`A_BW-1:0] ds_activation_o;
-    logic [`A_BW-1:0] ds_activation_cout_o;
-    logic [`ARRAY_S-1:0] ds_cout_valid_o;
     logic [`PSUM_BW-1:0] rsa_psum;
-    logic [`ARRAY_S*`CPSUM_W-1:0] csa_cpsum_o;
     logic [`ARRAY_S*`ACC_W-1:0] acc_o;
-
-    // WMEM address : write uses WPU's registered address, preload read uses TSC's
-    logic [`WMEM_ADDR_W-1:0] wmem_addr_w;
-    assign wmem_addr_w = (wmem_en_w) ? wpu_wmem_addr_o : wmem_addr;
-
-    // activation source : streamed host data (UB) or the previous layer's result
-    // still sitting in OBUF. Both memories have the same 1-cycle read latency and
-    // act_sel is descriptor-held, so the mux never moves inside a job.
-    assign act_row = (act_sel) ? obuf_data_o : ub_data_o;
-
-    // requant constants held by TSC (latched with the descriptor there), driven to OP
+    logic [`A_BW-1:0] op_data;
+    logic [`R_BW-1:0] op_r_data;
+    logic [`R_BW-1:0] ub_r_data;
     logic [`QMULT_W-1:0] qmult_q;
     logic [`QSHIFT_W-1:0] qshift_q;
 
-    // ================= control =================
+    assign wmem_mem_addr = wmem_we ? wpu_wmem_addr : wmem_addr;
+    assign ub_data_i = (r_valid && !r_from_ub) ? op_data : a_data;
+    assign activation_row = activation_valid ? ub_data_o : 0;
+    assign r_data = r_from_ub ? ub_r_data : op_r_data;
+
+    genvar i;
+    generate
+        for(i = 0; i < `ARRAY_S; i++) begin : OUTPUT_FORMAT
+            assign op_r_data[`R_W*i +: `R_W] = {
+                op_data[`A_W*i +: `A_W],
+                {(`R_W-`A_W){1'b0}}
+            };
+            assign ub_r_data[`R_W*i +: `R_W] = {
+                ub_data_o[`A_W*i +: `A_W],
+                {(`R_W-`A_W){1'b0}}
+            };
+        end
+    endgenerate
+
     TSC u_TSC(
         .clk(clk),
         .rst_n(rst_n),
         .cmd_valid(cmd_valid),
         .cmd_ready(cmd_ready),
-        .dim_m(dim_m),
-        .dim_k(dim_k),
-        .dim_n(dim_n),
-        .quant_mult(quant_mult),
-        .quant_shift(quant_shift),
-        .fuse_in(fuse_in),
-        .fuse_out(fuse_out),
+        .cmd_desc(cmd_desc),
         .busy(busy),
         .done(done),
         .w_valid(w_valid),
@@ -107,36 +92,26 @@ module TPU (
         .a_valid(a_valid),
         .a_ready(a_ready),
         .r_valid(r_valid),
+        .r_from_ub(r_from_ub),
         .r_ready(r_ready),
         .wpu_wmem_w(wpu_wmem_w),
         .wmem_addr(wmem_addr),
-        .wmem_en_c(wmem_en_c),
-        .wmem_en_w(wmem_en_w),
-        .ub_addr_w(ub_addr_w),
-        .ub_addr_r(ub_addr_r),
-        .ub_en_w(ub_en_w),
-        .ub_en_r(ub_en_r),
-        .obuf_addr_w(obuf_addr_w),
-        .obuf_addr_r(obuf_addr_r),
-        .obuf_en_w(obuf_en_w),
-        .obuf_en_r(obuf_en_r),
-        .act_sel(act_sel),
+        .wmem_en(wmem_en),
+        .wmem_we(wmem_we),
+        .ub_addr(ub_addr),
+        .ub_en(ub_en),
+        .ub_we(ub_we),
         .weight_valid(weight_valid),
         .skew_en(skew_en),
-        .comp_clr(comp_clr),
-        .csa_cw_valid(csa_cw_valid),
-        .csa_act_valid(csa_act_valid),
+        .activation_valid(activation_valid),
         .acc_clr(acc_clr),
         .acc_wr_en(acc_wr_en),
         .acc_wr_row(acc_wr_row),
-        .cacc_en(cacc_en),
-        .cacc_wr_row(cacc_wr_row),
         .acc_rd_en(acc_rd_en),
         .acc_rd_row(acc_rd_row),
         .quant_mult_q(qmult_q),
         .quant_shift_q(qshift_q));
 
-    // ================= weight path =================
     WPU u_WPU(
         .clk(clk),
         .rst_n(rst_n),
@@ -144,60 +119,31 @@ module TPU (
         .wmem_addr_i(wmem_addr),
         .wmem_w(wpu_wmem_w),
         .rweight(wpu_rweight),
-        .cweight(wpu_cweight),
-        .cout_valid(wpu_cout_valid),
-        .crow(wpu_crow),
-        .wmem_addr_o(wpu_wmem_addr_o));
+        .wmem_addr_o(wpu_wmem_addr));
 
     WMEM_Wrapper u_WMEM_Wrapper(
         .clk(clk),
-        .addr_w(wmem_addr_w),
+        .addr(wmem_mem_addr),
         .data_i(wpu_rweight),
-        .en_c(wmem_en_c),
-        .en_w(wmem_en_w),
+        .en(wmem_en),
+        .we(wmem_we),
         .data_o(wmem_data_o));
 
-    CMEM u_CMEM(
+    UB_Wrapper u_UB_Wrapper(
         .clk(clk),
-        .rst_n(rst_n),
-        .cout_valid(wpu_cout_valid),
-        .cweight(wpu_cweight),
-        .cweight_o(cmem_cweight_o));
-
-    // ================= activation path =================
-    // UB : 2 x 16-row streaming window (host activation)
-    UB_Wrapper #(.DEPTH(`AMEM_D)) u_UB_Wrapper(
-        .clk(clk),
-        .data_i(a_data),
-        .addr_w(ub_addr_w),
-        .addr_r(ub_addr_r),
-        .en_w(ub_en_w),
-        .en_r(ub_en_r),
+        .addr(ub_addr),
+        .data_i(ub_data_i),
+        .en(ub_en),
+        .we(ub_we),
         .data_o(ub_data_o));
-
-    // OBUF : 128-row layer-fusion buffer (this layer writes, next layer reads)
-    UB_Wrapper #(.DEPTH(`OBUF_D)) u_OBUF_Wrapper(
-        .clk(clk),
-        .data_i(r_data),
-        .addr_w(obuf_addr_w),
-        .addr_r(obuf_addr_r),
-        .en_w(obuf_en_w),
-        .en_r(obuf_en_r),
-        .data_o(obuf_data_o));
 
     Data_Setup u_Data_Setup(
         .clk(clk),
         .rst_n(rst_n),
-        .activation_i(act_row),
+        .activation_i(activation_row),
         .skew_en(skew_en),
-        .comp_clr(comp_clr),
-        .cout_valid(wpu_cout_valid),
-        .crow(wpu_crow),
-        .activation_o(ds_activation_o),
-        .activation_cout_o(ds_activation_cout_o),
-        .cout_valid_o(ds_cout_valid_o));
+        .activation_o(ds_activation_o));
 
-    // ================= compute =================
     RSA u_RSA(
         .clk(clk),
         .rst_n(rst_n),
@@ -206,27 +152,13 @@ module TPU (
         .activation(ds_activation_o),
         .psum(rsa_psum));
 
-    CSA u_CSA(
-        .clk(clk),
-        .rst_n(rst_n),
-        .cweight(cmem_cweight_o),
-        .cweight_valid(csa_cw_valid),
-        .activation(ds_activation_cout_o),
-        .activation_valid(csa_act_valid),
-        .cpsum_o(csa_cpsum_o));
-
-    // ================= accumulate + output =================
     ACC u_ACC(
         .clk(clk),
         .rst_n(rst_n),
         .acc_clr(acc_clr),
         .psum_i(rsa_psum),
-        .cpsum_i(csa_cpsum_o),
-        .cout_valid(ds_cout_valid_o),
         .acc_wr_en(acc_wr_en),
         .acc_wr_row(acc_wr_row),
-        .cacc_en(cacc_en),
-        .cacc_wr_row(cacc_wr_row),
         .acc_rd_en(acc_rd_en),
         .acc_rd_row(acc_rd_row),
         .acc_o(acc_o));
@@ -235,34 +167,6 @@ module TPU (
         .quant_mult(qmult_q),
         .quant_shift(qshift_q),
         .acc_i(acc_o),
-        .data_o(r_data));
-
-    // X-propagation checkpoints for RTL simulation.  The normal test target
-    // already enables +define+SVA; synthesis does not see this block.
-    `ifdef SVA
-        CHECK_W_INPUT_KNOWN: assert property (@(posedge clk) disable iff(!rst_n)
-            wpu_wmem_w |-> !$isunknown(w_data))
-        else $error("[XTRACE] raw weight input is unknown on an accepted load beat");
-
-        CHECK_WMEM_WRITE_KNOWN: assert property (@(posedge clk) disable iff(!rst_n)
-            (wmem_en_c && wmem_en_w) |-> !$isunknown({wmem_addr_w, wpu_rweight}))
-        else $error("[XTRACE] WMEM write address or encoded weight is unknown");
-
-        CHECK_WMEM_READ_KNOWN: assert property (@(posedge clk) disable iff(!rst_n)
-            weight_valid |-> !$isunknown(wmem_data_o))
-        else $error("[XTRACE] WMEM read data is unknown while preloading weights");
-
-        CHECK_ACT_READ_KNOWN: assert property (@(posedge clk) disable iff(!rst_n)
-            skew_en |-> !$isunknown(act_row))
-        else $error("[XTRACE] activation read data is unknown while feeding RSA");
-
-        CHECK_RSA_PSUM_KNOWN: assert property (@(posedge clk) disable iff(!rst_n)
-            (|acc_wr_en) |-> !$isunknown(rsa_psum))
-        else $error("[XTRACE] RSA psum is unknown when ACC writes it");
-
-        CHECK_ACC_READ_KNOWN: assert property (@(posedge clk) disable iff(!rst_n)
-            r_valid |-> !$isunknown(acc_o))
-        else $error("[XTRACE] ACC read data is unknown at output");
-    `endif
+        .data_o(op_data));
 
 endmodule

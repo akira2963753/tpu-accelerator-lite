@@ -60,7 +60,7 @@ module PATTERN(
     // ---------------------------- Tasks -------------------------
     //=============================================================
 
-    // Write Task
+    // Write
     task automatic mem_write(input [`WMEM_ADDR_W-1:0] a, input [`WMEM_DW-1:0] d);
         begin
             addr_w = a;
@@ -72,7 +72,7 @@ module PATTERN(
         end
     endtask
 
-    // Read Task
+    // Read
     task automatic mem_read_check(input [`WMEM_ADDR_W-1:0] a);
         begin
             addr_w = a;
@@ -84,22 +84,22 @@ module PATTERN(
         end
     endtask
 
-    // Phase 4 check : en_c=0 must inhibit a write. Write a known value, attempt a
+    // Check write disable.
     task automatic en_c_disable_check(input [`WMEM_ADDR_W-1:0] a);
         logic [`WMEM_DW-1:0] known;
         begin
-            // (1) known value in (en_c=1)
+            // Write known data.
             known = rand_data();
             mem_write(a, known);        
 
-            // (2) disabled write with different data (en_c=0) -> must be ignored
+            // Attempt disabled write.
             addr_w = a;
             data_i = ~known;
             en_c = 0;
             en_w = 1;
             @(negedge clk);
 
-            // (3) read back (en_c=1) -> memory must still hold 'known'
+            // Check preserved data.
             addr_w = a;
             en_c = 1;
             en_w = 0;
@@ -130,7 +130,7 @@ module PATTERN(
     //=============================================================
     initial begin
         init_dut();
-        // Phase 1 : write sweep over every address (covers all banks)
+        // Write sweep
         veri_phase = PHASE1;
         for(int t = 0; t < `TEST_NUM; t++) begin
             for (int a = 0; a < `WMEM_D; a++) mem_write(a[`WMEM_ADDR_W-1:0], rand_data());
@@ -138,7 +138,7 @@ module PATTERN(
         end
         $display("Phase 1 Pass.");
 
-        // Phase 2 : random read/write mix
+        // Random read/write
         veri_phase = PHASE2;
         for (int t = 0; t < `TEST_NUM; t++) begin
             int a = $urandom_range(0, `WMEM_D-1);
@@ -147,7 +147,7 @@ module PATTERN(
         end
         $display("Phase 2 Pass.");
 
-        // Phase 3 : write-then-read turnaround (write addr A, immediately read A back)
+        // Write/read turnaround
         veri_phase = PHASE3;
         for (int t = 0; t < `TEST_NUM; t++) begin
             for (int a = 0; a < `WMEM_D; a++) begin
@@ -157,7 +157,7 @@ module PATTERN(
         end
         $display("Phase 3 Pass.");
 
-        // Phase 4 : en_c disable -> a write issued with en_c=0 must NOT modify memory.
+        // Write disable
         veri_phase = PHASE4;
         for (int t = 0; t < `TEST_NUM; t++)
             for (int a = 0; a < `WMEM_D; a++) en_c_disable_check(a[`WMEM_ADDR_W-1:0]);

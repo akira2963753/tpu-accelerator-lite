@@ -6,11 +6,11 @@ import matplotlib.pyplot as plt
 # ---------------------------------------------------------------------------
 # Design parameters
 # ---------------------------------------------------------------------------
-ARRAY_S = 16      # systolic array dimension
-W_W     = 8       # raw weight width
-A_W     = 7       # activation width
-RW_W    = 5       # reduced weight width
-PSUM_W  = 8 + (A_W + 1) + 4   # = 20  (W_W + (A_W+1) + clog2(ARRAY_S))
+ARRAY_S = 16      # Array size
+W_W     = 8       # Weight width
+A_W     = 7       # Activation width
+RW_W    = 5       # Reduced weight width
+PSUM_W  = 8 + (A_W + 1) + 4   # Accumulator width
 
 MUL_W   = (RW_W - 1) + (A_W + 1)   # = 12
 RES_W   = W_W + (A_W + 1)          # = 16
@@ -24,7 +24,7 @@ def mask(v, bits):
 
 
 def signed(v, bits):
-    """把 bits 寬的無號值解讀成 two's-complement signed."""
+    """Interpret an unsigned value as signed."""
     v = mask(v, bits)
     if v & (1 << (bits - 1)):
         v -= (1 << bits)
@@ -32,7 +32,7 @@ def signed(v, bits):
 
 
 def sext(v, from_bits, to_bits):
-    """sign-extend from_bits -> to_bits (回傳無號表示)."""
+    """Sign-extend an unsigned value."""
     v = mask(v, from_bits)
     if v & (1 << (from_bits - 1)):
         v |= (((1 << (to_bits - from_bits)) - 1) << from_bits)
@@ -40,10 +40,10 @@ def sext(v, from_bits, to_bits):
 
 
 # ---------------------------------------------------------------------------
-# WPU : raw 8-bit weight -> 5-bit reduced code
+# Weight encoding
 # ---------------------------------------------------------------------------
 def is_msr4(w8):
-    """W[7:4] 全 0000 或 1111 -> MSR-4 (Non_MSR_4 == 0)."""
+    """Return whether a weight is MSR-4."""
     w8 = mask(w8, 8)
     top = (w8 >> 4) & 0xF
     and4 = 1 if top == 0xF else 0
@@ -53,76 +53,69 @@ def is_msr4(w8):
 
 
 def wpu_encode(w8):
-    """回傳 5-bit reduced weight code (無號 0..31)."""
+    """Encode one reduced weight."""
     w8 = mask(w8, 8)
     if is_msr4(w8):
-        # MSR-4 : {1'b0, W[4:1]}  (丟 LSB, RPE 內補 1)
+        # MSR-4 path
         return (0 << 4) | ((w8 >> 1) & 0xF)
     else:
-        # Non-MSR-4 : {1'b1, W[7:4]}
+        # Non-MSR-4 path
         return (1 << 4) | ((w8 >> 4) & 0xF)
 
 
 # ---------------------------------------------------------------------------
-# Reduced MAC : 逐位元照抄 RPE.sv 的 MAC (回傳單一 PE 的 signed 貢獻值)
+# Reduced MAC
 # ---------------------------------------------------------------------------
 def reduced_mac_contrib(rw5, act7):
     rw5 = mask(rw5, RW_W)
-    # ex_activation_i = {activation_i, 1'b1}  -> 8-bit
+    # Add guard bit
     act8 = mask((mask(act7, A_W) << 1) | 1, 8)
     act_sign = (act8 >> 7) & 1
 
     w_bit4 = (rw5 >> 4) & 1
     w_bit3 = (rw5 >> 3) & 1
-    w4 = rw5 & 0xF   # weight[3:0]
+    w4 = rw5 & 0xF   # Low bits
 
     weight_sign_add = w_bit3 & (1 - w_bit4)
     if w_bit3:
-        weight_i = mask((~w4) + weight_sign_add, 4)   # ~weight[3:0] + sign_add
+        weight_i = mask((~w4) + weight_sign_add, 4)   # Signed magnitude
     else:
         weight_i = w4
 
     if act_sign:
-        activation_i = mask((~act8) + 1, 8)            # abs (two's complement)
+        activation_i = mask((~act8) + 1, 8)            # Absolute value
     else:
         activation_i = act8
 
-    mul_result = mask(activation_i * weight_i, MUL_W)  # 12-bit unsigned magnitude
+    mul_result = mask(activation_i * weight_i, MUL_W)  # Magnitude
 
     if act_sign ^ w_bit3:
-        sign_result = mask((~mul_result) + 1, MUL_W)   # 套上符號 (negate)
+        sign_result = mask((~mul_result) + 1, MUL_W)   # Negate
     else:
         sign_result = mul_result
 
-    shift_result = mask(sign_result << 1, MUL_W + 1)   # 13-bit  (x2)
-    act8_sext13 = sext(act8, 8, MUL_W + 1)             # sign-extend activation 8->13
-    msr4_result = mask(shift_result + act8_sext13, MUL_W + 1)   # 13-bit : x2 + activation
-    no_msr4_result = mask(shift_result << 3, RES_W)    # 16-bit  (x8)
+    shift_result = mask(sign_result << 1, MUL_W + 1)   # x2
+    act8_sext13 = sext(act8, 8, MUL_W + 1)             # Sign-extend
+    msr4_result = mask(shift_result + act8_sext13, MUL_W + 1)   # MSR-4 result
+    no_msr4_result = mask(shift_result << 3, RES_W)    # Non-MSR-4 result
 
-    if w_bit4:                                         # Non-MSR-4 path
+    if w_bit4:                                         # Non-MSR-4
         result = no_msr4_result
-    else:                                              # MSR-4 path
-        result = sext(msr4_result, MUL_W + 1, RES_W)   # 13->16
+    else:                                              # MSR-4
+        result = sext(msr4_result, MUL_W + 1, RES_W)   # Sign-extend
 
-    return signed(result, RES_W)                       # 單一 PE 的 signed 貢獻
+    return signed(result, RES_W)                       # PE contribution
 
 
 def full_mac_contrib(w8, act7):
-    """完整 8b x 8b signed 理想參考值.
-
-    採用與 reduced 相同的 "LSB 期望值 = 1" 補償 :
-      - activation 補尾 1  -> a8 = {act, 1'b1}
-      - weight  LSB 固定 1 -> w8 | 1
-    如此對 MSR-4 weight, full 與 reduced 完全一致, 誤差只來自 (罕見的)
-    Non-MSR-4 weight 在無 compensation 下丟掉低 nibble 的近似.
-    """
-    a8s = signed((mask(act7, A_W) << 1) | 1, 8)        # signed(2*act + 1)
-    w8s = signed(mask(w8, 8) | 1, 8)                   # weight LSB 期望值固定 1
+    """Reference 8-bit MAC."""
+    a8s = signed((mask(act7, A_W) << 1) | 1, 8)        # Guard bit
+    w8s = signed(mask(w8, 8) | 1, 8)                   # Force LSB
     return a8s * w8s
 
 
 # ---------------------------------------------------------------------------
-# 陣列層 : out[m][c] = Σ_r mac(weight[r][c], A[m][r])
+# Array model
 # ---------------------------------------------------------------------------
 def reduced_array(RW, A):
     out = [[0] * ARRAY_S for _ in range(ARRAY_S)]
@@ -131,7 +124,7 @@ def reduced_array(RW, A):
             acc = 0
             for r in range(ARRAY_S):
                 acc += reduced_mac_contrib(RW[r][c], A[m][r])
-            out[m][c] = signed(mask(acc, PSUM_W), PSUM_W)   # 20-bit wrap (同硬體)
+            out[m][c] = signed(mask(acc, PSUM_W), PSUM_W)   # Hardware width
     return out
 
 
@@ -142,26 +135,26 @@ def full_array(W, A):
             acc = 0
             for r in range(ARRAY_S):
                 acc += full_mac_contrib(W[r][c], A[m][r])
-            out[m][c] = acc                                 # 完整精度, 不 wrap
+            out[m][c] = acc                                 # Full precision
     return out
 
 
 # ---------------------------------------------------------------------------
-# 隨機資料生成 (weight 偏 MSR-4)
+# Random data
 # ---------------------------------------------------------------------------
 def rand_weight(non_msr4_prob):
-    """偏 MSR-4 : 多數落在 signed [-16,15] (top nibble 全同), 少數注入 Non-MSR-4."""
+    """Generate mostly MSR-4 weights."""
     if random.random() < non_msr4_prob:
-        w = random.randint(-128, 127)          # 大機率 Non-MSR-4
-        while is_msr4(mask(w, 8)):              # 確保真的是 Non-MSR-4, 保證覆蓋率
+        w = random.randint(-128, 127)           # Likely Non-MSR-4
+        while is_msr4(mask(w, 8)):              # Enforce Non-MSR-4
             w = random.randint(-128, 127)
     else:
-        w = random.randint(-16, 15)            # MSR-4 範圍
+        w = random.randint(-16, 15)             # MSR-4 range
     return mask(w, 8)
 
 
 def rand_activation():
-    return mask(random.randint(-64, 63), A_W)  # 7-bit signed
+    return mask(random.randint(-64, 63), A_W)   # Signed 7-bit
 
 
 def gen_matrices(non_msr4_prob):
@@ -172,7 +165,7 @@ def gen_matrices(non_msr4_prob):
 
 
 # ---------------------------------------------------------------------------
-# .dat 寫檔 : 每行一個 row, 各 lane 打包成一個寬 hex (lane i 佔 [w*i +: w])
+# File I/O
 # ---------------------------------------------------------------------------
 def pack_row(values, lane_w):
     packed = 0
@@ -192,14 +185,10 @@ def write_dat(path, rows, total_bits):
 
 
 # ---------------------------------------------------------------------------
-# 精度比較報告
+# Reports
 # ---------------------------------------------------------------------------
 def per_mac_report(all_W, all_A):
-    """逐一 PE 比較 full vs reduced, 依 MSR-4 / Non-MSR-4 分類.
-
-    MSR-4 path 應 100% exact (驗證 MSR-4 模型與 pipeline 正確);
-    Non-MSR-4 為預期近似 (standalone 無 compensation).
-    """
+    """Report MAC accuracy."""
     msr4_n = msr4_exact = 0
     non_n = 0
     non_abs = 0
@@ -209,7 +198,7 @@ def per_mac_report(all_W, all_A):
         for row in W:
             for w8 in row:
                 rw = wpu_encode(w8)
-                for act in acts[:ARRAY_S]:   # 抽樣一列 activation 即可
+                for act in acts[:ARRAY_S]:   # Sample one row
                     f = full_mac_contrib(w8, act)
                     r = reduced_mac_contrib(rw, act)
                     if is_msr4(w8):
@@ -259,7 +248,7 @@ def accuracy_report(all_full, all_reduced):
 
 
 def plot_error(all_full, all_reduced, stats):
-    """畫 full vs reduced 誤差圖 : 左=散佈(對角線), 右=誤差直方圖."""
+    """Plot reduced-MAC error."""
 
     full = [v for of in all_full for row in of for v in row]
     reduced = [v for orr in all_reduced for row in orr for v in row]
@@ -267,7 +256,7 @@ def plot_error(all_full, all_reduced, stats):
 
     fig, (ax0, ax1) = plt.subplots(1, 2, figsize=(12, 5))
 
-    # 左 : full (x) vs reduced (y), 疊上 y=x 理想線
+    # Scatter plot
     lo = min(min(full), min(reduced))
     hi = max(max(full), max(reduced))
     ax0.scatter(full, reduced, s=6, alpha=0.35, edgecolors="none")
@@ -278,7 +267,7 @@ def plot_error(all_full, all_reduced, stats):
     ax0.legend(loc="upper left")
     ax0.grid(True, alpha=0.3)
 
-    # 右 : 誤差分布
+    # Error histogram
     ax1.hist(err, bins=61, color="#4472c4", edgecolor="white", linewidth=0.3)
     ax1.axvline(0, color="r", linestyle="--", linewidth=1)
     ax1.set_xlabel("Error  (reduced - full)")
@@ -297,7 +286,7 @@ def plot_error(all_full, all_reduced, stats):
 
 
 # ---------------------------------------------------------------------------
-# main
+# Main
 # ---------------------------------------------------------------------------
 def main():
     ap = argparse.ArgumentParser(description="RSA reduced systolic array golden generator")
@@ -329,13 +318,13 @@ def main():
         all_W.append(W)
         all_A.append(A)
 
-        # weight_reduced.dat : row r = 16 lane 的 5-bit reduced code
+        # Reduced weights
         for r in range(ARRAY_S):
             w_rows.append(pack_row(RW[r], RW_W))
-        # activation.dat : row m = 16 lane 的 7-bit activation
+        # Activations
         for m in range(ARRAY_S):
             a_rows.append(pack_row(A[m], A_W))
-        # golden.dat : row m = 16 column 的 20-bit psum (mask 成無號)
+        # Golden output
         for m in range(ARRAY_S):
             g_rows.append(pack_row([mask(v, PSUM_W) for v in out_reduced[m]], PSUM_W))
 

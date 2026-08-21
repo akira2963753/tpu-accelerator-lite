@@ -5,60 +5,57 @@
 * Project:      tpu-accelerator-lite
 * Module:       WMEM_Wrapper
 * Author:       Marco <harry2963753@gmail.com>
-* Veri:         PASS
 *
 ******************************************************************************/
 
 module WMEM_Wrapper (
     input clk,
-    input [`WMEM_ADDR_W-1:0] addr_w,    // wmem waddr
-    input [`WMEM_DW-1:0] data_i,        // wmem data in (per row packed)
-    input en_c,                         // chip enable
-    input en_w,                         // write enable
-    output logic [`WMEM_DW-1:0] data_o  // wmem data out (per row packed)
+    input [`WMEM_ADDR_W-1:0] addr,
+    input [`WMEM_DW-1:0] data_i,
+    input en,
+    input we,
+    output logic [`WMEM_DW-1:0] data_o
 );
 
-    // memory width would be not prefectly match the data width we needed (per row) 
-    localparam ZERO_PAD = `WMEM_W - `WMEM_DW;
+    localparam PAD_W = `WMEM_PW - `WMEM_DW;
 
-    // memory data in and out
-    logic [`WMEM_W-1:0] mdata_i;
-    logic [`WMEM_W-1:0] mdata_o [0:`WMEM_BANKS-1];
-
-    // memory bank selected
+    logic [`WMEM_PW-1:0] macro_data_i;
+    logic [`WMEM_PW-1:0] macro_data_o [0:`WMEM_BANKS-1];
     logic [`WMEM_BSEL_W-1:0] bsel;
     logic [`WMEM_BSEL_W-1:0] bsel_q;
-
-    // memory addr
-    logic [`WMEM_MADDR_W-1:0] maddr;
+    logic [`SRAM_ADDR_W-1:0] maddr;
 
     always_comb begin : WMEM_ADDR_SPLIT
-        mdata_i = {{ZERO_PAD{1'b0}}, data_i};    
-        bsel = addr_w[`WMEM_ADDR_W-1:`WMEM_MADDR_W];    // high bits: bank select
-        maddr = addr_w[`WMEM_MADDR_W-1:0];              // low bits: intra-macro address
+        macro_data_i = {{PAD_W{1'b0}}, data_i};
+        bsel = addr[`WMEM_ADDR_W-1:`SRAM_ADDR_W];
+        maddr = addr[`SRAM_ADDR_W-1:0];
     end
 
-    always_ff @(posedge clk) bsel_q <= bsel;            // reading would be needed 1 cycle delay
-    always_comb data_o = mdata_o[bsel_q][0+:`WMEM_DW];  // select reading data
+    always_ff @(posedge clk) begin
+        if(en && !we) bsel_q <= bsel;
+    end
 
-    // WMem Structure : 4-bank x (16 x 88-bit) = 64 x 88-bit
-    genvar b;
+    always_comb data_o = macro_data_o[bsel_q][0 +: `WMEM_DW];
+
+    genvar b, m;
     generate
         for(b = 0; b < `WMEM_BANKS; b = b + 1) begin : BANK_GEN
-            TS1N16ADFPCLLLVTA16X88M2SWSHOD u_Weight_Mem(
-                .CLK(clk),
-                .CEB(~(en_c & (bsel == b))),
-                .WEB(~(en_w & (bsel == b))),
-                .A(maddr),
-                .D(mdata_i),
-                .Q(mdata_o[b]),
-                .BWEB({`WMEM_W{~(en_w & (bsel == b))}}),
-                .SLP(1'd0),
-                .DSLP(1'd0),
-                .SD(1'd0),
-                .PUDELAY(),
-                .RTSEL(2'b01),
-                .WTSEL(2'b01));
+            for(m = 0; m < `WMEM_WMACROS; m = m + 1) begin : WIDTH_GEN
+                TS1N16ADFPCLLLVTA512X45M4SWSHOD u_Weight_Memory(
+                    .CLK(clk),
+                    .CEB(~(en && (bsel == b))),
+                    .WEB(~(en && we && (bsel == b))),
+                    .A(maddr),
+                    .D(macro_data_i[`SRAM_W*m +: `SRAM_W]),
+                    .Q(macro_data_o[b][`SRAM_W*m +: `SRAM_W]),
+                    .BWEB({`SRAM_W{~(en && we && (bsel == b))}}),
+                    .SLP(1'b0),
+                    .DSLP(1'b0),
+                    .SD(1'b0),
+                    .PUDELAY(),
+                    .RTSEL(2'b01),
+                    .WTSEL(2'b01));
+            end
         end
     endgenerate
 

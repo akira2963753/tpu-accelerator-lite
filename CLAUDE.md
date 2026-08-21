@@ -21,7 +21,10 @@ directory, and `PATTERN.sv` reads its `.dat` via `../00_TESTBED/pattern/`.
 
 ```bash
 cd src/01_RTL
-make -f ../00_TESTBED/makefile vcs_rtl        # whole suite, no waves
+make -f ../00_TESTBED/makefile gen_suite      # generate data + software descriptor traces
+make -f ../00_TESTBED/makefile check_replay   # validate trace/data mapping
+make -f ../00_TESTBED/makefile vcs_rtl        # whole serial-command suite, no waves
+make -f ../00_TESTBED/makefile rtl_regress    # gen_suite -> check_replay -> VCS regression
 make -f ../00_TESTBED/makefile vcs_rtl_dump   # same + FSDB (opt-in: suite is ~3.2M cycles)
 make -f ../00_TESTBED/makefile vcs_gate       # needs ../02_SYN/Netlist/TPU_syn.{v,sdf}
 make -f ../00_TESTBED/makefile clean
@@ -35,18 +38,21 @@ cd src/02_SYN
 dc_shell -f syn16.tcl | tee syn.log           # DESIGN=TPU, CYCLE=2ns, ss0p72v125c
 ```
 
-Generating the verification suite (host machine, needs **numpy**):
+Generating the verification suite (host machine, standard-library Python only):
 
 ```bash
 cd src/00_TESTBED
-python3 python/gen_suite.py                   # default tier, ~3.2M DUT cycles
-python3 python/gen_suite.py --big             # + the 1024^3 case (~22M more cycles)
+python3 python/gen_suite.py                   # default tier (serial-command cycle estimate in suite_summary.txt)
+python3 python/gen_suite.py --big             # + the 1024^3 case
 python3 python/check_replay.py                # verify the .dat replay contract (fast)
 ```
 
 `gen_suite.py` is the **single source of truth** for the test list; `test_suite.svh`
 and `suite_summary.txt` are generated — never hand-edit them. To add a test, append
 a `T(...)` row to `TEST_TABLE` and rerun. `pattern/*.dat` is gitignored.
+
+The current Host-facing interface and legal command schedules are documented in
+[`docs/COMMAND_PROTOCOL.md`](docs/COMMAND_PROTOCOL.md).
 
 Fast standalone control check (~1 s, run this before the full suite):
 
@@ -96,10 +102,10 @@ for with a full periphery tax per macro. That single fact drives the memory desi
 `UB_Wrapper` is parameterised on `DEPTH`; both instances use the same 16x120 macro.
 
 **The UB is not a full-K activation cache.** One k-tile (16 rows) is streamed in per
-`(mt,nt,kt)` and consumed by the following `CAL`. That is what decouples UB depth
-from K — otherwise `K_MAX=1024` would need 128 macros. The cost is that activation
-is re-streamed once per `nt` (~1.8x host traffic); weight was already re-streamed
-once per `mt`, which is the larger waste and the thing to fix next.
+`(mt,nt,kt)` and consumed by the following `GEMM`. That is what decouples UB depth
+from K — otherwise `K_MAX=1024` would need 128 macros. A K=16 command schedule
+keeps each preloaded `(nt,0)` weight tile resident across all `mt` tiles; K>16 still
+reloads each K tile because ACC holds one output tile at a time.
 
 ### The MAC decomposition (RPE + CPE are one arithmetic unit)
 
@@ -115,7 +121,21 @@ This is the least obvious part of the design and must be changed as a pair:
   compensation term. Fix one side without the other and every negative non-MSR-4
   weight is off by 16*activation.
 
-### Control FSM (`TSC.sv`)
+### Serial descriptor controller (`TSC.sv`)
+
+The current controller accepts one 512-bit command descriptor only while idle:
+`IDLE -> {LOAD_W | PRELOAD_W | LOAD_A | GEMM | STORE_C} -> DONE -> IDLE`.
+`cmd_ready` is high only in `IDLE`; `done` is a one-cycle completion pulse. The
+Host, not the RTL, guarantees resource order and waits for `cmd_ready` before
+every command. See [`docs/COMMAND_PROTOCOL.md`](docs/COMMAND_PROTOCOL.md) for the
+field map and legal schedules.
+
+`LOAD_W` and `PRELOAD_W` are deliberately separate. Once preloaded, a 16x16
+weight tile remains resident in RSA/CSA, so K=16 workloads can reuse it across
+multiple M tiles. `ACC_INIT` clears ACC at the beginning of each output tile;
+`STORE_C` is separate and applies requantization only after the full K reduction.
+
+### Historical whole-job controller (superseded)
 
 `IDLE -> LOADING -> PRELOAD_W -> CAL -> (LOADING | OUT) -> (LOADING | DONE)`
 
@@ -132,7 +152,8 @@ row address.
 
 ### Layer fusion (`fuse_in` / `fuse_out`)
 
-Descriptor bits latched with the dims. `fuse_out` also writes each result row to
+`FUSE_IN` / `FUSE_OUT` are descriptor fields latched for the relevant command.
+`fuse_out` also writes each result row to
 `OBUF[nt*16 + m]`; `fuse_in` reads activation from `OBUF[kt*16 + m]` instead of the
 host — the *same address formula*, which is why the producer's writes replay exactly
 as the consumer's reads. A fused job asks for zero activation beats.
@@ -144,16 +165,20 @@ descriptor port + counter width; **K is the expensive one** because a job's whol
 K-reduction lands in one accumulator before requant, so `ACC_W = PSUM_W +
 $clog2(K_MAX/ARRAY_S) = 28` and `max|C| = 4096*127*127 = 66M < 2^27`.
 
-There is **no way to split K across jobs**: `OP` applies ReLU + requant
-unconditionally and `r_data` is only 7-bit, so partial sums cannot leave the chip.
-Adding `acc_first`/`acc_last` descriptor bits is the change that would lift this.
+K is now split across **GEMM descriptors within one output tile**: `ACC_INIT`
+marks the first K tile and preserves ACC through later K tiles until `STORE_C`.
+Partial sums still cannot cross a `STORE_C` boundary, because `OP` applies ReLU +
+requant and `r_data` is only 7-bit.
 
 ### Hard constraints — assertions exist in PATTERN, not in the RTL
 
 `PATTERN.sv`'s SVA block (`+define+SVA`) checks these; the RTL itself does not:
 
-- dims multiple of 16 and within `M_MAX`/`K_MAX`/`N_MAX` (`TSC` derives tile counts
-  with a right shift and silently truncates otherwise).
+- The Host derives valid `mt`/`kt`/`nt` tile indices from dimensions that are
+  multiples of 16 and within `M_MAX`/`K_MAX`/`N_MAX`; TSC does not validate them.
+- Commands obey the serial resource sequence documented in
+  `docs/COMMAND_PROTOCOL.md`; TSC intentionally contains no validity/dependency
+  scoreboard.
 - `fuse_out` needs `M <= 16` (the write address ignores `mt`) and `N <= OBUF_D`.
 - `fuse_in` needs `M <= 16` and `K <= OBUF_D`.
 - **At most one non-MSR-4 weight per column per 16-row tile.** `CMEM` and
@@ -166,17 +191,20 @@ Adding `acc_first`/`acc_last` descriptor bits is the change that would lift this
 
 ### The .dat replay contract
 
-The `.dat` files hold only **unique** data; `PATTERN.sv` replays them in the DUT's
-request order. Get this wrong and every case fails mysteriously:
+Python compiles the Host command schedule into `tNN_command.dat`; `PATTERN.sv`
+only replays that trace and its associated unique data. Get an index wrong and
+every case fails mysteriously:
 
 | file | rows | PATTERN index |
 |---|---|---|
-| `tNN_weight.dat` | `NT*KT*16` | `i % (NT*KT*16)` |
-| `tNN_activation.dat` | `MT*KT*16` | `mt*KT*16 + kt*16 + m` |
-| `tNN_golden.dat` | `MT*NT*16` | `i` |
+| `tNN_command.dat` | `TEST_CMD_COUNT[t]` | sequential command `c` |
+| `tNN_weight.dat` | `NT*KT*16` | `(nt*KT + kt)*16 + r` |
+| `tNN_activation.dat` | `MT*KT*16` | `(mt*KT + kt)*16 + m` |
+| `tNN_golden.dat` | `MT*NT*16` | `(mt*NT + nt)*16 + m` |
 
-`python/check_replay.py` re-implements both maps and checks every beat — run it after
-touching `gen_case`'s row ordering or `feed_w`/`feed_a`.
+`python/check_replay.py` validates the software descriptor compiler and both data
+maps — run it after touching `tpu_command.py`, `gen_case` row ordering, or PATTERN's
+stream transactors.
 
 ### define.vh
 
