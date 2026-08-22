@@ -146,13 +146,13 @@ Run the compiler self-check and generate the complete three-layer MLP from
 `src/00_TESTBED`:
 
 ```sh
-python3 model/check_compiler.py
-python3 model/tpu_compiler.py compile \
-    model/artifacts/mnist/mnist_mlp.json --outdir model/build
-python3 model/tpu_compiler.py emit-test \
-    model/build/compiled_model.json \
-    --inputs model/artifacts/mnist/mnist_mlp.json
-python3 model/tpu_compiler.py replay pattern
+python3 compiler/check_compiler.py
+python3 compiler/tpu_compiler.py compile \
+    compiler/artifacts/mnist/mnist_mlp.json --outdir compiler/build
+python3 compiler/tpu_compiler.py emit-test \
+    compiler/build/compiled_model.json \
+    --inputs compiler/artifacts/mnist/mnist_mlp.json
+python3 compiler/tpu_compiler.py replay pattern
 ```
 
 Then run RTL from `src/01_RTL`:

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Reference inference and quantization analysis for the TPU compiler."""
+"""Reference inference and quantization analysis for compiled TPU models."""
 
 import numpy as np
 

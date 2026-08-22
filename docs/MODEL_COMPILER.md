@@ -16,11 +16,10 @@ reporting remain in software.
 ## Architecture
 
 ```text
-src/00_TESTBED/model/
+src/00_TESTBED/compiler/
 |-- pytorch_exporter.py # Generic PyTorch package exporter
 |-- models/
 |   `-- mnist_mlp.py    # MNIST architecture and preprocessing adapter
-|-- mnist_mlp.py        # Compatibility exporter entry point
 |-- tpu_compiler.py     # Quantization, lowering, scheduling and emission
 |-- tpu_reference.py    # Bit-true inference and quantization analysis
 `-- check_compiler.py   # Deterministic compiler self-check
@@ -34,7 +33,7 @@ architecture construction and dataset collection. The generic model format is
 The exported package contains:
 
 ```text
-model/artifacts/mnist/
+compiler/artifacts/mnist/
 |-- mnist_mlp.json     # Graph, shapes and tensor names
 `-- mnist_mlp.npz      # Weights, bias, calibration and MNIST samples
 ```
@@ -50,19 +49,19 @@ a machine with PyTorch, torchvision, the checkpoint and MNIST access.
 Run from `src/00_TESTBED`:
 
 ```sh
-python3 model/mnist_mlp.py \
+python3 compiler/models/mnist_mlp.py \
     --download \
     --checkpoint ../../model/MLP/mnist_mlp_model.pth \
-    --outdir model/artifacts/mnist
+    --outdir compiler/artifacts/mnist
 ```
 
 When the checkpoint is already under `model/MLP/`, `--checkpoint` can be
 omitted:
 
 ```sh
-python3 model/mnist_mlp.py \
+python3 compiler/models/mnist_mlp.py \
     --download \
-    --outdir model/artifacts/mnist
+    --outdir compiler/artifacts/mnist
 ```
 
 The exporter saves 512 calibration images, a balanced 32-image RTL batch, and
@@ -75,17 +74,17 @@ The compiler needs Python and NumPy, but not PyTorch. Compilation and RTL test
 emission are separate:
 
 ```sh
-python3 model/check_compiler.py
+python3 compiler/check_compiler.py
 
-python3 model/tpu_compiler.py compile \
-    model/artifacts/mnist/mnist_mlp.json \
-    --outdir model/build
+python3 compiler/tpu_compiler.py compile \
+    compiler/artifacts/mnist/mnist_mlp.json \
+    --outdir compiler/build
 
-python3 model/tpu_compiler.py emit-test \
-    model/build/compiled_model.json \
-    --inputs model/artifacts/mnist/mnist_mlp.json
+python3 compiler/tpu_compiler.py emit-test \
+    compiler/build/compiled_model.json \
+    --inputs compiler/artifacts/mnist/mnist_mlp.json
 
-python3 model/tpu_compiler.py replay pattern
+python3 compiler/tpu_compiler.py replay pattern
 ```
 
 `compile` performs model import, Type-2/A5 calibration and target lowering. It
@@ -110,8 +109,8 @@ exercises the N tail and uses `ACT_NONE`.
 Run the hardware-aware Python model over all exported MNIST test images:
 
 ```sh
-python3 model/tpu_compiler.py evaluate \
-    model/artifacts/mnist/mnist_mlp.json
+python3 compiler/tpu_compiler.py evaluate \
+    compiler/artifacts/mnist/mnist_mlp.json
 ```
 
 This accuracy includes activation quantization, WPU Type-2 weight reduction,
@@ -121,8 +120,8 @@ bias, requantization and activation mode.
 Before bit-true analysis, run the non-bit-true quantization ablation:
 
 ```sh
-python3 model/tpu_compiler.py ablate \
-    model/artifacts/mnist/mnist_mlp.json
+python3 compiler/tpu_compiler.py ablate \
+    compiler/artifacts/mnist/mnist_mlp.json
 ```
 
 It reports FP32, INT8 weight, Type-2 weight, ordinary INT4 activation and the

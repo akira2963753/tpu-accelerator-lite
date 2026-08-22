@@ -42,8 +42,9 @@ __pycache__/
 # ---- model training artifacts --------------------------------------------
 *.pth
 model/**/data/
-src/00_TESTBED/model/artifacts/
-src/00_TESTBED/model/data/
+src/00_TESTBED/compiler/artifacts/
+src/00_TESTBED/compiler/build/
+src/00_TESTBED/compiler/data/
 
 # ---- LaTeX spec build -----------------------------------------------------
 spec/build/

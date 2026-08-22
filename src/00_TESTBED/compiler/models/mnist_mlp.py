@@ -9,9 +9,9 @@ import numpy as np
 
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-MODEL_ROOT = os.path.dirname(HERE)
-if MODEL_ROOT not in sys.path:
-    sys.path.insert(0, MODEL_ROOT)
+COMPILER_ROOT = os.path.dirname(HERE)
+if COMPILER_ROOT not in sys.path:
+    sys.path.insert(0, COMPILER_ROOT)
 
 import pytorch_exporter as exporter  # noqa: E402
 
@@ -48,7 +48,9 @@ def find_checkpoint(checkpoint):
             raise FileNotFoundError(path)
         return path
 
-    project_root = os.path.normpath(os.path.join(MODEL_ROOT, "..", "..", ".."))
+    project_root = os.path.normpath(
+        os.path.join(COMPILER_ROOT, "..", "..", "..")
+    )
     candidates = [
         os.path.join(os.getcwd(), CHECKPOINT_NAME),
         os.path.join(project_root, "model", "MLP", CHECKPOINT_NAME),
@@ -139,9 +141,9 @@ def main():
     )
     parser.add_argument("--checkpoint", default=None)
     parser.add_argument("--outdir", default=os.path.join(
-        "model", "artifacts", "mnist"
+        "compiler", "artifacts", "mnist"
     ))
-    parser.add_argument("--data-dir", default=os.path.join("model", "data"))
+    parser.add_argument("--data-dir", default=os.path.join("compiler", "data"))
     parser.add_argument("--batch-size", type=int, default=128)
     parser.add_argument("--calibration-count", type=int, default=512)
     parser.add_argument("--rtl-count", type=int, default=32)

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Self-check the project 784-512-256-10 MLP compiler flow."""
+"""Self-check the portable TPU compiler flow."""
 
 import json
 import os

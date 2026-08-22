@@ -382,7 +382,7 @@ src/00_TESTBED/
 |   `-- tNN_*.dat
 |-- directed/                  # Existing synthetic regression tools
 |-- python/                    # Shared command and arithmetic model
-`-- model/
+`-- compiler/
     |-- pytorch_exporter.py    # Generic PyTorch frontend exporter
     |-- models/                # Model architecture adapters
     |-- tpu_compiler.py        # Compiler CLI and target backend
@@ -404,10 +404,10 @@ SystemVerilog.
 The initial public interface is:
 
 ```text
-python3 model/tpu_compiler.py compile <model> [options]
-python3 model/tpu_compiler.py emit-test <compiled-model> --inputs <package>
-python3 model/tpu_compiler.py replay <bundle>
-python3 model/check_compiler.py
+python3 compiler/tpu_compiler.py compile <model> [options]
+python3 compiler/tpu_compiler.py emit-test <compiled-model> --inputs <package>
+python3 compiler/tpu_compiler.py replay <bundle>
+python3 compiler/check_compiler.py
 ```
 
 The `compile` command imports, calibrates and quantizes a portable model into a

@@ -16,8 +16,8 @@ syn_tcl="syn16.tcl"
 syn_log="syn.log"
 PROFILE ?= regression
 SIM_ARGS ?=
-MODEL ?= model/artifacts/mnist/mnist_mlp.json
-COMPILED_MODEL ?= model/build/compiled_model.json
+MODEL ?= compiler/artifacts/mnist/mnist_mlp.json
+COMPILED_MODEL ?= compiler/build/compiled_model.json
 MODEL_BATCH ?= 32
 
 #======================================================
@@ -70,16 +70,16 @@ prepare_vectors: gen_suite check_replay
 rtl_regress: prepare_vectors vcs_rtl
 
 model_check:
-	cd ../00_TESTBED && python3 model/check_compiler.py
+	cd ../00_TESTBED && python3 compiler/check_compiler.py
 
 model_compile:
-	cd ../00_TESTBED && python3 model/tpu_compiler.py compile ${MODEL} --outdir model/build
+	cd ../00_TESTBED && python3 compiler/tpu_compiler.py compile ${MODEL} --outdir compiler/build
 
 model_emit: model_compile
-	cd ../00_TESTBED && python3 model/tpu_compiler.py emit-test ${COMPILED_MODEL} --inputs ${MODEL} --batch-size ${MODEL_BATCH}
+	cd ../00_TESTBED && python3 compiler/tpu_compiler.py emit-test ${COMPILED_MODEL} --inputs ${MODEL} --batch-size ${MODEL_BATCH}
 
 model_replay: model_emit
-	cd ../00_TESTBED && python3 model/tpu_compiler.py replay pattern
+	cd ../00_TESTBED && python3 compiler/tpu_compiler.py replay pattern
 
 rtl_mnist: model_replay
 	${VCS_RTL}

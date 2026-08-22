@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Export PyTorch model adapters into the portable TPU model format."""
+"""Export PyTorch adapters into the portable TPU compiler format."""
 
 import json
 import os
