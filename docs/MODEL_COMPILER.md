@@ -108,10 +108,23 @@ python3 model/tpu_compiler.py ablate \
     model/artifacts/mnist/mnist_mlp.json
 ```
 
-It reports FP32, INT8 weight, Type-2 weight, ordinary INT4 activation and fixed
-LSB activation accuracy. These stages use floating-point MAC and bias without
-PSUM/ACC wrapping or integer `QMULT/QSHIFT`. Add `--include-bittrue` to append
-the complete hardware-aware result to the same table.
+It reports FP32, INT8 weight, Type-2 weight, ordinary INT4 activation and the
+hardware A5 fixed-LSB activation accuracy. A5 has four stored payload bits and
+reconstructs the MAC operand as `{payload[3:0], 1'b1}`. These stages use
+floating-point MAC and bias without PSUM/ACC wrapping or integer
+`QMULT/QSHIFT`.
+
+Add `--include-bittrue` to append these progressive hardware stages:
+
+1. Compiler activation scales with floating-point MAC and bias.
+2. INT64 MAC with floating-point bias.
+3. Quantized 29-bit bias.
+4. Integer `QMULT/QSHIFT` and output saturation.
+5. 21-bit PSUM wrapping.
+6. 29-bit ACC wrapping, identical to the complete bit-true model.
+
+The first stage whose accuracy decreases identifies the hardware rule that
+needs investigation.
 
 ## RTL Simulation
 

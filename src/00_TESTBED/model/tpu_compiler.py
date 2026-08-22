@@ -1026,6 +1026,157 @@ def fake_inference(model_path, inputs, weight_mode, activation_codebook=None,
     return np.asarray(predictions, dtype=np.int64), layers
 
 
+def compiler_scale_float_inference(model_path, inputs, batch_size=512,
+                                   compiled=None):
+    if compiled is None:
+        _, _, tensors, layers = compile_quantized_layers(model_path)
+    else:
+        tensors, layers = compiled
+    inputs = np.asarray(inputs, dtype=np.float64)
+    predictions = []
+    for base in range(0, inputs.shape[0], batch_size):
+        values = inputs[base:base + batch_size]
+        for layer in layers:
+            source = layer.ir
+            payload = quantize_activation(values, layer.input_scale)
+            activation = decode_activation_np(payload) * layer.input_scale
+            weight = effective_weight_np(
+                layer.raw_weight.T
+            ).astype(np.float64) * layer.weight_scale
+            bias = np.asarray(tensors[source.bias_key], dtype=np.float64) \
+                if source.bias_key else np.zeros(source.out_features)
+            values = np.matmul(activation, weight.T) + bias
+            if source.activation == "relu":
+                values = np.maximum(values, 0.0)
+        predictions.extend(np.argmax(values, axis=1).tolist())
+    return np.asarray(predictions, dtype=np.int64)
+
+
+def progressive_accumulate(payload, raw_weight, bias_acc, k_dim,
+                           psum_wrap=False, acc_wrap=False):
+    activation = decode_activation_np(payload)
+    weight = effective_weight_np(raw_weight)
+    bias_acc = np.asarray(bias_acc, dtype=np.int64)
+
+    if not psum_wrap:
+        accumulator = np.matmul(
+            activation[:, :k_dim], weight[:k_dim, :]
+        ).astype(np.int64)
+        return accumulator + bias_acc
+
+    accumulator = None
+    for k_base in range(0, k_dim, tc.ARRAY_S):
+        k_valid = min(tc.ARRAY_S, k_dim - k_base)
+        psum = np.matmul(
+            activation[:, k_base:k_base + k_valid],
+            weight[k_base:k_base + k_valid, :],
+        )
+        psum = wrap_signed_np(psum, tg.PSUM_W)
+        if accumulator is None:
+            accumulator = psum + bias_acc
+        else:
+            accumulator = accumulator + psum
+        if acc_wrap:
+            accumulator = wrap_signed_np(accumulator, tg.ACC_W)
+    return accumulator.astype(np.int64)
+
+
+def requant_no_wrap(accumulator, qmult, qshift, act_mode):
+    values = np.asarray(accumulator, dtype=np.int64)
+    if act_mode == tc.ACT_RELU:
+        values = np.maximum(values, 0)
+    quantized = (values * int(qmult)) >> int(qshift)
+    minimum = 0 if act_mode == tc.ACT_RELU else tg.SAT_MIN
+    quantized = np.clip(quantized, minimum, tg.SAT_MAX).astype(np.int64)
+    return (quantized & 0xF).astype(np.uint8)
+
+
+def progressive_integer_inference(model_path, inputs, mode, batch_size=512,
+                                  compiled=None):
+    if compiled is None:
+        _, _, tensors, layers = compile_quantized_layers(model_path)
+    else:
+        tensors, layers = compiled
+    inputs = np.asarray(inputs, dtype=np.float64)
+    predictions = []
+    for base in range(0, inputs.shape[0], batch_size):
+        values = inputs[base:base + batch_size]
+        payload = quantize_activation(values, layers[0].input_scale)
+        for layer_index, layer in enumerate(layers):
+            source = layer.ir
+            bias_float = np.asarray(tensors[source.bias_key], dtype=np.float64) \
+                if source.bias_key else np.zeros(source.out_features)
+            use_bias29 = mode != "int64_fp_bias"
+            psum_wrap = mode in ("psum21", "bittrue")
+            acc_wrap = mode == "bittrue"
+            bias_acc = layer.bias_acc if use_bias29 else \
+                np.zeros(source.out_features, dtype=np.int64)
+            accumulator = progressive_accumulate(
+                payload,
+                layer.raw_weight,
+                bias_acc,
+                source.in_features,
+                psum_wrap=psum_wrap,
+                acc_wrap=acc_wrap,
+            )
+
+            use_integer_requant = mode in ("requant", "psum21", "bittrue")
+            if use_integer_requant:
+                payload = output_payload_np(
+                    accumulator, layer.qmult, layer.qshift, layer.act_mode
+                )[0] if acc_wrap else requant_no_wrap(
+                    accumulator, layer.qmult, layer.qshift, layer.act_mode
+                )
+                if layer_index == len(layers) - 1:
+                    values = signed_payload_np(payload)
+                continue
+
+            accumulator_scale = layer.input_scale * layer.weight_scale
+            values = accumulator.astype(np.float64) * accumulator_scale
+            if not use_bias29:
+                values = values + bias_float
+            if source.activation == "relu":
+                values = np.maximum(values, 0.0)
+            if layer_index != len(layers) - 1:
+                next_scale = layers[layer_index + 1].input_scale
+                payload = quantize_activation(values, next_scale)
+        predictions.extend(np.argmax(values, axis=1).tolist())
+    return np.asarray(predictions, dtype=np.int64)
+
+
+def bittrue_breakdown(model_path, inputs, labels, batch_size=512):
+    labels = np.asarray(labels, dtype=np.int64)
+    _, _, tensors, layers = compile_quantized_layers(model_path)
+    compiled = tensors, layers
+    stages = []
+    predictions = compiler_scale_float_inference(
+        model_path, inputs, batch_size, compiled
+    )
+    stages.append({
+        "name": "A5 compiler-scale FP MAC",
+        "accuracy": float(np.mean(predictions == labels)),
+        "weight_mse": None,
+        "activation_scales": None,
+    })
+    for name, mode in (
+        ("A5 + INT64 MAC + FP32 bias", "int64_fp_bias"),
+        ("+ Bias29", "bias29"),
+        ("+ Integer QMULT/QSHIFT", "requant"),
+        ("+ PSUM21 wrap", "psum21"),
+        ("+ ACC29 wrap (bit-true)", "bittrue"),
+    ):
+        predictions = progressive_integer_inference(
+            model_path, inputs, mode, batch_size, compiled
+        )
+        stages.append({
+            "name": name,
+            "accuracy": float(np.mean(predictions == labels)),
+            "weight_mse": None,
+            "activation_scales": None,
+        })
+    return stages
+
+
 def quantization_ablation(model_path, inputs, labels, batch_size=512,
                           include_bittrue=False):
     stages = [
@@ -1033,7 +1184,7 @@ def quantization_ablation(model_path, inputs, labels, batch_size=512,
         ("INT8-W", "int8", None),
         ("Type2-W", "type2", None),
         ("Type2-W + INT4-A", "type2", "int4"),
-        ("Type2-W + FixedLSB-A", "type2", "fixed_lsb"),
+        ("Type2-W + A5 FixedLSB", "type2", "fixed_lsb"),
     ]
     labels = np.asarray(labels, dtype=np.int64)
     results = []
@@ -1048,13 +1199,9 @@ def quantization_ablation(model_path, inputs, labels, batch_size=512,
             "activation_scales": [layer["input_scale"] for layer in layers],
         })
     if include_bittrue:
-        predictions = hardware_inference(model_path, inputs, batch_size)
-        results.append({
-            "name": "Bit-true TPU",
-            "accuracy": float(np.mean(predictions == labels)),
-            "weight_mse": None,
-            "activation_scales": None,
-        })
+        results.extend(bittrue_breakdown(
+            model_path, inputs, labels, batch_size
+        ))
     return results
 
 
@@ -1153,7 +1300,7 @@ def build_parser():
     evaluate_parser.set_defaults(function=evaluate_command)
 
     ablate_parser = subparsers.add_parser(
-        "ablate", help="compare non-bit-true quantization stages"
+        "ablate", help="compare quantization and bit-true stages"
     )
     ablate_parser.add_argument("model", help="model JSON file")
     ablate_parser.add_argument("--batch-size", type=int, default=512)

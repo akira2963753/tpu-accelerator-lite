@@ -128,8 +128,36 @@ def main():
                 "INT8-W",
                 "Type2-W",
                 "Type2-W + INT4-A",
-                "Type2-W + FixedLSB-A",
+                "Type2-W + A5 FixedLSB",
             ],
+        ))
+
+        breakdown = compiler.bittrue_breakdown(
+            model_path,
+            tensors["rtl_inputs"][:4],
+            tensors["rtl_labels"][:4],
+            batch_size=2,
+        )
+        checks.append((
+            "progressive bit-true ablation",
+            [stage["name"] for stage in breakdown] == [
+                "A5 compiler-scale FP MAC",
+                "A5 + INT64 MAC + FP32 bias",
+                "+ Bias29",
+                "+ Integer QMULT/QSHIFT",
+                "+ PSUM21 wrap",
+                "+ ACC29 wrap (bit-true)",
+            ],
+        ))
+        progressive = compiler.progressive_integer_inference(
+            model_path,
+            tensors["rtl_inputs"][:4],
+            "bittrue",
+            batch_size=2,
+        )
+        checks.append((
+            "progressive final stage equivalence",
+            np.array_equal(progressive, predictions[:4]),
         ))
 
     print("TPU model compiler self-check")
