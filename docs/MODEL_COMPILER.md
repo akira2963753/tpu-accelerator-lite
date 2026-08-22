@@ -1,4 +1,4 @@
-# MNIST MLP Compiler
+# TPU Model Compiler
 
 ## Scope
 
@@ -13,14 +13,23 @@ UB and become the next layer's GEMM source. Every `STORE_C` is checked by RTL,
 so a mismatch is localized to the first failing layer. Argmax and accuracy
 reporting remain in software.
 
-## Files
+## Architecture
 
 ```text
 src/00_TESTBED/model/
-|-- mnist_mlp.py       # Existing checkpoint inference and portable export
-|-- tpu_compiler.py    # Quantization, tiling, scheduling and bundle replay
-`-- check_compiler.py  # Deterministic 784-512-256-10 self-check
+|-- pytorch_exporter.py # Generic PyTorch package exporter
+|-- models/
+|   `-- mnist_mlp.py    # MNIST architecture and preprocessing adapter
+|-- mnist_mlp.py        # Compatibility exporter entry point
+|-- tpu_compiler.py     # Quantization, lowering, scheduling and emission
+|-- tpu_reference.py    # Bit-true inference and quantization analysis
+`-- check_compiler.py   # Deterministic compiler self-check
 ```
+
+The compiler consumes a portable model package and does not import PyTorch or
+know MNIST-specific preprocessing. Model adapters own checkpoint loading,
+architecture construction and dataset collection. The generic model format is
+`tpu-model-v1`; legacy `tpu-mlp-v1` packages remain accepted.
 
 The exported package contains:
 
@@ -62,19 +71,27 @@ standard deviation `0.3081`.
 
 ## Compiler Flow
 
-The compiler needs Python and NumPy, but not PyTorch:
+The compiler needs Python and NumPy, but not PyTorch. Compilation and RTL test
+emission are separate:
 
 ```sh
 python3 model/check_compiler.py
 
 python3 model/tpu_compiler.py compile \
-    model/artifacts/mnist/mnist_mlp.json
+    model/artifacts/mnist/mnist_mlp.json \
+    --outdir model/build
+
+python3 model/tpu_compiler.py emit-test \
+    model/build/compiled_model.json \
+    --inputs model/artifacts/mnist/mnist_mlp.json
 
 python3 model/tpu_compiler.py replay pattern
 ```
 
-`compile` replaces the active files under `pattern/`. The bundle contains one
-test with all three layers, including intermediate `STORE_C` results.
+`compile` performs model import, Type-2/A5 calibration and target lowering. It
+produces `compiled_model.json` and `compiled_model.npz`, which contain no test
+dataset. `emit-test` adds a selected input batch and replaces the active files
+under `pattern/`. The resulting bundle checks every intermediate `STORE_C`.
 
 The MNIST dimensions map to the hardware as follows:
 

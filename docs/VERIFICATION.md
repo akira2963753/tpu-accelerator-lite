@@ -147,7 +147,11 @@ Run the compiler self-check and generate the complete three-layer MLP from
 
 ```sh
 python3 model/check_compiler.py
-python3 model/tpu_compiler.py compile model/artifacts/mnist/mnist_mlp.json
+python3 model/tpu_compiler.py compile \
+    model/artifacts/mnist/mnist_mlp.json --outdir model/build
+python3 model/tpu_compiler.py emit-test \
+    model/build/compiled_model.json \
+    --inputs model/artifacts/mnist/mnist_mlp.json
 python3 model/tpu_compiler.py replay pattern
 ```
 

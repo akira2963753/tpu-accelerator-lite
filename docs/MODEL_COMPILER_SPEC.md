@@ -276,15 +276,16 @@ outputs. Overflow of the signed 29-bit accumulator is a compile-time error.
 
 ## Compiler Architecture
 
-The compiler exposes one public driver, `tpu_compiler.py`. Internal stages may
-be functions or classes in the same implementation; the command-line flow must
-remain integrated.
+The compiler exposes one public driver, `tpu_compiler.py`. PyTorch model
+adapters use `pytorch_exporter.py` to produce the portable frontend IR.
+Bit-true inference and ablation live in `tpu_reference.py` and share the target
+arithmetic contract without becoming compiler passes.
 
 ```text
 PyTorch model and calibration data
               |
               v
-       Frontend Model IR
+    Portable Frontend Model IR
               |
               v
    Legalize and fold operators
@@ -302,10 +303,13 @@ PyTorch model and calibration data
  Virtual slot allocation/liveness
               |
               v
- Descriptor and stream backend
+    Compiled Model Artifact
               |
               v
- Bit-exact trace replay and bundle
+ Input binding and stream backend
+              |
+              v
+ Bit-exact RTL test bundle
 ```
 
 ### Internal Representations
@@ -379,7 +383,10 @@ src/00_TESTBED/
 |-- directed/                  # Existing synthetic regression tools
 |-- python/                    # Shared command and arithmetic model
 `-- model/
-    |-- tpu_compiler.py        # Integrated compiler CLI
+    |-- pytorch_exporter.py    # Generic PyTorch frontend exporter
+    |-- models/                # Model architecture adapters
+    |-- tpu_compiler.py        # Compiler CLI and target backend
+    |-- tpu_reference.py       # Bit-true analysis
     `-- check_compiler.py      # Compiler self-check
 ```
 
@@ -398,13 +405,16 @@ The initial public interface is:
 
 ```text
 python3 model/tpu_compiler.py compile <model> [options]
+python3 model/tpu_compiler.py emit-test <compiled-model> --inputs <package>
 python3 model/tpu_compiler.py replay <bundle>
 python3 model/check_compiler.py
 ```
 
-The `compile` command imports, calibrates, quantizes, schedules, emits, and
-replays the workload before reporting success. A bundle is valid only when its
-independent bit-exact replay passes.
+The `compile` command imports, calibrates and quantizes a portable model into a
+`tpu-compiled-v1` artifact. The artifact contains reduced weights, accumulator
+bias, scales and descriptor parameters, but no test samples. `emit-test` binds
+an input batch, schedules commands, emits streams and verifies the independent
+bit-exact replay before reporting success.
 
 ## Verification Contract
 

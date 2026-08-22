@@ -14,6 +14,9 @@ if HERE not in sys.path:
     sys.path.insert(0, HERE)
 
 import tpu_compiler as compiler  # noqa: E402
+import tpu_reference as reference  # noqa: E402
+import pytorch_exporter as exporter  # noqa: E402
+from models import mnist_mlp  # noqa: E402
 
 
 def write_demo_model(root):
@@ -52,6 +55,7 @@ def write_demo_model(root):
             "format": compiler.MODEL_FORMAT,
             "name": "compiler_self_check_mnist_mlp",
             "input_features": 784,
+            "output_semantics": "classification_logits",
             "tensor_file": "demo.npz",
             "layers": entries,
         }, output, indent=2)
@@ -96,6 +100,12 @@ def main():
     with tempfile.TemporaryDirectory(prefix="tpu-compiler-") as root:
         model_path = write_demo_model(root)
         _, _, tensors, _ = compiler.load_model(model_path)
+        checks.append((
+            "generic frontend contract",
+            exporter.MODEL_FORMAT == compiler.MODEL_FORMAT and
+            mnist_mlp.model_ir()["output_semantics"] ==
+            "classification_logits",
+        ))
         bundle = compiler.build_workload(
             model_path, tensors["rtl_inputs"], tensors["rtl_labels"]
         )
@@ -125,12 +135,36 @@ def main():
             final_requant["rank"]["total"],
         ))
 
-        predictions = compiler.hardware_inference(
+        _, model, _source_tensors, quantized_layers = \
+            compiler.compile_quantized_layers(model_path)
+        compiled_path = compiler.write_compiled_model(
+            os.path.join(root, "compiled"),
+            model_path,
+            model,
+            quantized_layers,
+        )
+        compiled = compiler.load_compiled_model(compiled_path)
+        compiled_bundle = compiler.build_workload(
+            compiled_path,
+            tensors["rtl_inputs"],
+            tensors["rtl_labels"],
+            compiled=compiled,
+        )
+        checks.append((
+            "compile and emit-test separation",
+            [command.word for command in compiled_bundle.commands] ==
+            [command.word for command in bundle.commands] and
+            compiled_bundle.weight_rows == bundle.weight_rows and
+            compiled_bundle.activation_rows == bundle.activation_rows and
+            compiled_bundle.golden_rows == bundle.golden_rows,
+        ))
+
+        predictions = reference.hardware_inference(
             model_path, tensors["rtl_inputs"], batch_size=11
         )
         checks.append(("batched hardware inference", predictions.shape == (32,)))
 
-        ablation = compiler.quantization_ablation(
+        ablation = reference.quantization_ablation(
             model_path,
             tensors["rtl_inputs"][:8],
             tensors["rtl_labels"][:8],
@@ -147,7 +181,7 @@ def main():
             ],
         ))
 
-        breakdown = compiler.bittrue_breakdown(
+        breakdown = reference.bittrue_breakdown(
             model_path,
             tensors["rtl_inputs"][:4],
             tensors["rtl_labels"][:4],
@@ -164,7 +198,7 @@ def main():
                 "+ ACC29 wrap (bit-true)",
             ],
         ))
-        progressive = compiler.progressive_integer_inference(
+        progressive = reference.progressive_integer_inference(
             model_path,
             tensors["rtl_inputs"][:4],
             "bittrue",

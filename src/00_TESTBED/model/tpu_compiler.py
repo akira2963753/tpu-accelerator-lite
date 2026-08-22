@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Compile a quantized multi-layer MLP into one TPU replay bundle."""
+"""Compile portable models for the 32x32 Type-2 TPU target."""
 
 import argparse
 import hashlib
@@ -22,7 +22,13 @@ import tpu_command as tc  # noqa: E402
 import tpu_gen as tg  # noqa: E402
 
 
-MODEL_FORMAT = "tpu-mlp-v1"
+if __name__ == "__main__":
+    sys.modules.setdefault("tpu_compiler", sys.modules[__name__])
+
+
+MODEL_FORMAT = "tpu-model-v1"
+LEGACY_MODEL_FORMAT = "tpu-mlp-v1"
+COMPILED_FORMAT = "tpu-compiled-v1"
 BUNDLE_FORMAT = "tpu-workload-v1"
 
 
@@ -384,7 +390,7 @@ def load_model(model_path):
     model_path = os.path.abspath(model_path)
     with open(model_path, "r", encoding="utf-8") as source:
         model = json.load(source)
-    if model.get("format") != MODEL_FORMAT:
+    if model.get("format") not in (MODEL_FORMAT, LEGACY_MODEL_FORMAT):
         raise ValueError("unsupported model format")
 
     model_dir = os.path.dirname(model_path)
@@ -394,6 +400,10 @@ def load_model(model_path):
     layers = []
     previous_features = int(model["input_features"])
     for entry in model["layers"]:
+        if entry.get("type", "linear").lower() != "linear":
+            raise ValueError(
+                "operator %s is not lowered to GEMM yet" % entry.get("type")
+            )
         activation = entry.get("activation", "none").lower()
         if activation not in ("none", "relu"):
             raise ValueError("unsupported activation %s" % activation)
@@ -435,6 +445,10 @@ def compile_quantized_layers(model_path):
     calibration_payload = quantize_activation(calibration_float, input_scale)
     quantized_layers = []
 
+    output_semantics = model.get("output_semantics")
+    if output_semantics is None and model.get("format") == LEGACY_MODEL_FORMAT:
+        output_semantics = "classification_logits"
+
     for layer_index, layer in enumerate(layers):
         weight = np.asarray(tensors[layer.weight_key], dtype=np.float64)
         bias = np.asarray(tensors[layer.bias_key], dtype=np.float64) \
@@ -465,7 +479,8 @@ def compile_quantized_layers(model_path):
         output_scale = choose_a5_scale(reference)
         requant_factor = accumulator_scale / (2.0 * output_scale)
         rank_stats = None
-        if layer_index == len(layers) - 1:
+        if (layer_index == len(layers) - 1 and
+                output_semantics == "classification_logits"):
             (qmult, qshift, output_payload, output_stats,
              output_scale, rank_stats) = choose_rank_requant(
                 accumulator, reference, requant_factor, act_mode
@@ -521,6 +536,105 @@ def compile_quantized_layers(model_path):
         calibration_payload = output_payload
         input_scale = output_scale
     return model_path, model, tensors, quantized_layers
+
+
+def write_compiled_model(outdir, model_path, model, layers):
+    os.makedirs(outdir, exist_ok=True)
+    tensor_name = "compiled_model.npz"
+    tensor_path = os.path.join(outdir, tensor_name)
+    arrays = {}
+    entries = []
+    for index, layer in enumerate(layers):
+        weight_key = "layer_%d.raw_weight" % index
+        bias_key = "layer_%d.bias_acc" % index
+        arrays[weight_key] = layer.raw_weight.astype(np.uint8)
+        arrays[bias_key] = layer.bias_acc.astype(np.int64)
+        entries.append({
+            "name": layer.ir.name,
+            "type": "linear",
+            "in_features": layer.ir.in_features,
+            "out_features": layer.ir.out_features,
+            "activation": layer.ir.activation,
+            "has_bias": bool(layer.ir.bias_key),
+            "raw_weight": weight_key,
+            "bias_acc": bias_key,
+            "weight_scale": layer.weight_scale,
+            "input_scale": layer.input_scale,
+            "output_scale": layer.output_scale,
+            "qmult": layer.qmult,
+            "qshift": layer.qshift,
+            "act_mode": layer.act_mode,
+            "stats": layer.stats,
+        })
+    np.savez_compressed(tensor_path, **arrays)
+
+    output_semantics = model.get("output_semantics")
+    if output_semantics is None and model.get("format") == LEGACY_MODEL_FORMAT:
+        output_semantics = "classification_logits"
+    document = {
+        "format": COMPILED_FORMAT,
+        "name": model.get("name", "model"),
+        "source_model": os.path.basename(model_path),
+        "input_features": int(model["input_features"]),
+        "output_semantics": output_semantics or "tensor",
+        "target": asdict(TargetSpec()),
+        "tensor_file": tensor_name,
+        "tensor_sha256": sha256_file(tensor_path),
+        "layers": entries,
+    }
+    compiled_path = os.path.join(outdir, "compiled_model.json")
+    with open(compiled_path, "w", newline="\n", encoding="utf-8") as output:
+        json.dump(document, output, indent=2)
+        output.write("\n")
+    return compiled_path
+
+
+def load_compiled_model(compiled_path):
+    compiled_path = os.path.abspath(compiled_path)
+    with open(compiled_path, "r", encoding="utf-8") as source:
+        document = json.load(source)
+    if document.get("format") != COMPILED_FORMAT:
+        raise ValueError("unsupported compiled model format")
+    if document.get("target") != asdict(TargetSpec()):
+        raise ValueError("compiled model target does not match this TPU")
+
+    tensor_path = os.path.join(
+        os.path.dirname(compiled_path), document["tensor_file"]
+    )
+    if sha256_file(tensor_path) != document["tensor_sha256"]:
+        raise AssertionError("compiled tensor checksum mismatch")
+    with np.load(tensor_path, allow_pickle=False) as archive:
+        arrays = {name: archive[name] for name in archive.files}
+
+    layers = []
+    for entry in document["layers"]:
+        ir = LayerIR(
+            name=entry["name"],
+            in_features=int(entry["in_features"]),
+            out_features=int(entry["out_features"]),
+            weight_key=entry["raw_weight"],
+            bias_key="compiled_bias" if entry["has_bias"] else "",
+            activation=entry["activation"],
+        )
+        layers.append(QuantizedLayer(
+            ir=ir,
+            raw_weight=np.asarray(arrays[entry["raw_weight"]], dtype=np.uint8),
+            bias_acc=np.asarray(arrays[entry["bias_acc"]], dtype=np.int64),
+            weight_scale=float(entry["weight_scale"]),
+            input_scale=float(entry["input_scale"]),
+            output_scale=float(entry["output_scale"]),
+            qmult=int(entry["qmult"]),
+            qshift=int(entry["qshift"]),
+            act_mode=int(entry["act_mode"]),
+            stats=entry["stats"],
+        ))
+    model = {
+        "name": document["name"],
+        "input_features": int(document["input_features"]),
+        "output_semantics": document.get("output_semantics", "tensor"),
+        "layers": document["layers"],
+    }
+    return compiled_path, model, layers
 
 
 def allocate_slots(count, excluded, capacity):
@@ -579,8 +693,11 @@ def pack_output_tile_np(output, mt, nt):
     return rows
 
 
-def build_workload(model_path, rtl_inputs, rtl_labels=None):
-    model_path, model, _tensors, layers = compile_quantized_layers(model_path)
+def build_workload(model_path, rtl_inputs, rtl_labels=None, compiled=None):
+    if compiled is None:
+        model_path, model, _tensors, layers = compile_quantized_layers(model_path)
+    else:
+        model_path, model, layers = compiled
     rtl_inputs = np.asarray(rtl_inputs, dtype=np.float64)
     if rtl_inputs.ndim != 2 or rtl_inputs.shape[1] != model["input_features"]:
         raise ValueError("RTL input shape mismatch")
@@ -795,7 +912,7 @@ def build_workload(model_path, rtl_inputs, rtl_labels=None):
         "source_model": os.path.basename(model_path),
         "target": asdict(target),
         "test": {
-            "name": "mnist_mlp",
+            "name": model.get("name", "model") + "_rtl",
             "M": m_dim,
             "K": int(model["input_features"]),
             "N": int(layers[-1].ir.out_features),
@@ -878,7 +995,7 @@ def write_summary(path, bundle):
     manifest = bundle.manifest
     test = manifest["test"]
     with open(path, "w", newline="\n") as output:
-        output.write("TPU MNIST MLP workload\n")
+        output.write("TPU compiled model workload\n")
         output.write("=" * 72 + "\n")
         output.write("shape          : %d x %d -> %d\n" %
                      (test["M"], test["K"], test["N"]))
@@ -997,350 +1114,42 @@ def replay_bundle(bundle_path):
     return manifest
 
 
-def hardware_inference(model_path, inputs, batch_size=256):
-    _, _, _, layers = compile_quantized_layers(model_path)
-    inputs = np.asarray(inputs, dtype=np.float64)
-    predictions = []
-    for base in range(0, inputs.shape[0], batch_size):
-        values = inputs[base:base + batch_size]
-        payload = quantize_activation(values, layers[0].input_scale)
-        for layer in layers:
-            accumulator = exact_accumulate(
-                payload, layer.raw_weight, layer.bias_acc, layer.ir.in_features
-            )
-            payload, _ = output_payload_np(
-                accumulator, layer.qmult, layer.qshift, layer.act_mode
-            )
-        predictions.extend(np.argmax(signed_payload_np(payload), axis=1).tolist())
-    return np.asarray(predictions, dtype=np.int64)
-
-
-def fake_weight(weight, mode):
-    weight = np.asarray(weight, dtype=np.float64)
-    if mode == "fp32":
-        return weight.copy()
-
-    raw, effective_scale, stats = quantize_weight(weight)
-    if mode == "int8":
-        signed_raw = np.where(raw.astype(np.int64) >= 128,
-                              raw.astype(np.int64) - 256,
-                              raw.astype(np.int64))
-        return signed_raw.astype(np.float64) * stats["raw_scale"]
-    if mode == "type2":
-        return effective_weight_np(raw).astype(np.float64) * effective_scale
-    raise ValueError("unsupported fake weight mode %s" % mode)
-
-
-def fake_quant_activation(values, scale, codebook, relu):
-    values = np.asarray(values, dtype=np.float64)
-    if scale <= 0.0:
-        raise ValueError("fake quant scale must be positive")
-
-    if codebook == "int4":
-        quantized = round_half_up(values / scale)
-        minimum = 0 if relu else -8
-        quantized = np.clip(quantized, minimum, 7)
-        return quantized * scale
-    if codebook == "fixed_lsb":
-        quantized = round_half_up((values / scale - 1.0) / 2.0)
-        minimum = 0 if relu else -8
-        quantized = np.clip(quantized, minimum, 7)
-        return (quantized * 2.0 + 1.0) * scale
-    raise ValueError("unsupported activation codebook %s" % codebook)
-
-
-def choose_fake_scale(values, codebook, relu):
-    values = np.asarray(values, dtype=np.float64)
-    if codebook == "fixed_lsb":
-        return choose_a5_scale(values)
-
-    magnitude = values if relu else np.abs(values)
-    magnitude = magnitude[np.isfinite(magnitude)]
-    if magnitude.size == 0 or float(np.max(magnitude)) == 0.0:
-        return 1.0e-12
-
-    maximum_level = 7.0
-    percentiles = (90.0, 95.0, 97.0, 98.0, 99.0, 99.5,
-                   99.9, 99.95, 99.99, 100.0)
-    best_scale = None
-    best_error = None
-    for percentile in percentiles:
-        clip = float(np.percentile(magnitude, percentile))
-        if clip <= 0.0:
-            continue
-        scale = clip / maximum_level
-        reconstructed = fake_quant_activation(values, scale, codebook, relu)
-        error = float(np.mean((reconstructed - values) ** 2))
-        if best_error is None or error < best_error:
-            best_scale = scale
-            best_error = error
-    return best_scale
-
-
-def prepare_fake_model(model_path, weight_mode, activation_codebook=None):
-    _, model, tensors, layers = load_model(model_path)
-    calibration = np.asarray(tensors["calibration_inputs"], dtype=np.float64)
-    fake_layers = []
-    input_relu = False
-    input_scale = choose_fake_scale(
-        calibration, activation_codebook, input_relu
-    ) if activation_codebook else None
-
-    for layer_index, ir in enumerate(layers):
-        weight = np.asarray(tensors[ir.weight_key], dtype=np.float64)
-        bias = np.asarray(tensors[ir.bias_key], dtype=np.float64) \
-            if ir.bias_key else np.zeros(ir.out_features, dtype=np.float64)
-        reduced_weight = fake_weight(weight, weight_mode)
-        layer_input = fake_quant_activation(
-            calibration, input_scale, activation_codebook, input_relu
-        ) if activation_codebook else calibration
-        output = np.matmul(layer_input, reduced_weight.T) + bias
-        output_relu = ir.activation == "relu"
-        if output_relu:
-            output = np.maximum(output, 0.0)
-
-        next_scale = None
-        if activation_codebook and layer_index != len(layers) - 1:
-            next_scale = choose_fake_scale(
-                output, activation_codebook, output_relu
-            )
-        fake_layers.append({
-            "ir": ir,
-            "weight": reduced_weight,
-            "bias": bias,
-            "input_scale": input_scale,
-            "input_relu": input_relu,
-            "weight_mse": float(np.mean((reduced_weight - weight) ** 2)),
-        })
-        calibration = output
-        input_scale = next_scale
-        input_relu = output_relu
-    return model, tensors, fake_layers
-
-
-def fake_inference(model_path, inputs, weight_mode, activation_codebook=None,
-                   batch_size=512):
-    _, _, layers = prepare_fake_model(
-        model_path, weight_mode, activation_codebook
-    )
-    inputs = np.asarray(inputs, dtype=np.float64)
-    predictions = []
-    for base in range(0, inputs.shape[0], batch_size):
-        values = inputs[base:base + batch_size]
-        for layer in layers:
-            if activation_codebook:
-                values = fake_quant_activation(
-                    values,
-                    layer["input_scale"],
-                    activation_codebook,
-                    layer["input_relu"],
-                )
-            values = np.matmul(values, layer["weight"].T) + layer["bias"]
-            if layer["ir"].activation == "relu":
-                values = np.maximum(values, 0.0)
-        predictions.extend(np.argmax(values, axis=1).tolist())
-    return np.asarray(predictions, dtype=np.int64), layers
-
-
-def compiler_scale_float_inference(model_path, inputs, batch_size=512,
-                                   compiled=None):
-    if compiled is None:
-        _, _, tensors, layers = compile_quantized_layers(model_path)
-    else:
-        tensors, layers = compiled
-    inputs = np.asarray(inputs, dtype=np.float64)
-    predictions = []
-    for base in range(0, inputs.shape[0], batch_size):
-        values = inputs[base:base + batch_size]
-        for layer in layers:
-            source = layer.ir
-            payload = quantize_activation(values, layer.input_scale)
-            activation = decode_activation_np(payload) * layer.input_scale
-            weight = effective_weight_np(
-                layer.raw_weight.T
-            ).astype(np.float64) * layer.weight_scale
-            bias = np.asarray(tensors[source.bias_key], dtype=np.float64) \
-                if source.bias_key else np.zeros(source.out_features)
-            values = np.matmul(activation, weight.T) + bias
-            if source.activation == "relu":
-                values = np.maximum(values, 0.0)
-        predictions.extend(np.argmax(values, axis=1).tolist())
-    return np.asarray(predictions, dtype=np.int64)
-
-
-def progressive_accumulate(payload, raw_weight, bias_acc, k_dim,
-                           psum_wrap=False, acc_wrap=False):
-    activation = decode_activation_np(payload)
-    weight = effective_weight_np(raw_weight)
-    bias_acc = np.asarray(bias_acc, dtype=np.int64)
-
-    if not psum_wrap:
-        accumulator = np.matmul(
-            activation[:, :k_dim], weight[:k_dim, :]
-        ).astype(np.int64)
-        return accumulator + bias_acc
-
-    accumulator = None
-    for k_base in range(0, k_dim, tc.ARRAY_S):
-        k_valid = min(tc.ARRAY_S, k_dim - k_base)
-        psum = np.matmul(
-            activation[:, k_base:k_base + k_valid],
-            weight[k_base:k_base + k_valid, :],
-        )
-        psum = wrap_signed_np(psum, tg.PSUM_W)
-        if accumulator is None:
-            accumulator = psum + bias_acc
-        else:
-            accumulator = accumulator + psum
-        if acc_wrap:
-            accumulator = wrap_signed_np(accumulator, tg.ACC_W)
-    return accumulator.astype(np.int64)
-
-
-def requant_no_wrap(accumulator, qmult, qshift, act_mode):
-    values = np.asarray(accumulator, dtype=np.int64)
-    if act_mode == tc.ACT_RELU:
-        values = np.maximum(values, 0)
-    quantized = (values * int(qmult)) >> int(qshift)
-    minimum = 0 if act_mode == tc.ACT_RELU else tg.SAT_MIN
-    quantized = np.clip(quantized, minimum, tg.SAT_MAX).astype(np.int64)
-    return (quantized & 0xF).astype(np.uint8)
-
-
-def progressive_integer_inference(model_path, inputs, mode, batch_size=512,
-                                  compiled=None):
-    if compiled is None:
-        _, _, tensors, layers = compile_quantized_layers(model_path)
-    else:
-        tensors, layers = compiled
-    inputs = np.asarray(inputs, dtype=np.float64)
-    predictions = []
-    for base in range(0, inputs.shape[0], batch_size):
-        values = inputs[base:base + batch_size]
-        payload = quantize_activation(values, layers[0].input_scale)
-        for layer_index, layer in enumerate(layers):
-            source = layer.ir
-            bias_float = np.asarray(tensors[source.bias_key], dtype=np.float64) \
-                if source.bias_key else np.zeros(source.out_features)
-            use_bias29 = mode != "int64_fp_bias"
-            psum_wrap = mode in ("psum21", "bittrue")
-            acc_wrap = mode == "bittrue"
-            bias_acc = layer.bias_acc if use_bias29 else \
-                np.zeros(source.out_features, dtype=np.int64)
-            accumulator = progressive_accumulate(
-                payload,
-                layer.raw_weight,
-                bias_acc,
-                source.in_features,
-                psum_wrap=psum_wrap,
-                acc_wrap=acc_wrap,
-            )
-
-            use_integer_requant = mode in ("requant", "psum21", "bittrue")
-            if use_integer_requant:
-                payload = output_payload_np(
-                    accumulator, layer.qmult, layer.qshift, layer.act_mode
-                )[0] if acc_wrap else requant_no_wrap(
-                    accumulator, layer.qmult, layer.qshift, layer.act_mode
-                )
-                if layer_index == len(layers) - 1:
-                    values = signed_payload_np(payload)
-                continue
-
-            accumulator_scale = layer.input_scale * layer.weight_scale
-            values = accumulator.astype(np.float64) * accumulator_scale
-            if not use_bias29:
-                values = values + bias_float
-            if source.activation == "relu":
-                values = np.maximum(values, 0.0)
-            if layer_index != len(layers) - 1:
-                next_scale = layers[layer_index + 1].input_scale
-                payload = quantize_activation(values, next_scale)
-        predictions.extend(np.argmax(values, axis=1).tolist())
-    return np.asarray(predictions, dtype=np.int64)
-
-
-def bittrue_breakdown(model_path, inputs, labels, batch_size=512,
-                      compiled=None):
-    labels = np.asarray(labels, dtype=np.int64)
-    if compiled is None:
-        _, _, tensors, layers = compile_quantized_layers(model_path)
-        compiled = tensors, layers
-    stages = []
-    predictions = compiler_scale_float_inference(
-        model_path, inputs, batch_size, compiled
-    )
-    stages.append({
-        "name": "A5 compiler-scale FP MAC",
-        "accuracy": float(np.mean(predictions == labels)),
-        "weight_mse": None,
-        "activation_scales": None,
-    })
-    for name, mode in (
-        ("A5 + INT64 MAC + FP32 bias", "int64_fp_bias"),
-        ("+ Bias29", "bias29"),
-        ("+ Integer QMULT/QSHIFT", "requant"),
-        ("+ PSUM21 wrap", "psum21"),
-        ("+ ACC29 wrap (bit-true)", "bittrue"),
-    ):
-        predictions = progressive_integer_inference(
-            model_path, inputs, mode, batch_size, compiled
-        )
-        stages.append({
-            "name": name,
-            "accuracy": float(np.mean(predictions == labels)),
-            "weight_mse": None,
-            "activation_scales": None,
-        })
-    return stages
-
-
-def quantization_ablation(model_path, inputs, labels, batch_size=512,
-                          include_bittrue=False, compiled=None):
-    stages = [
-        ("FP32", "fp32", None),
-        ("INT8-W", "int8", None),
-        ("Type2-W", "type2", None),
-        ("Type2-W + INT4-A", "type2", "int4"),
-        ("Type2-W + A5 FixedLSB", "type2", "fixed_lsb"),
-    ]
-    labels = np.asarray(labels, dtype=np.int64)
-    results = []
-    for name, weight_mode, codebook in stages:
-        predictions, layers = fake_inference(
-            model_path, inputs, weight_mode, codebook, batch_size
-        )
-        results.append({
-            "name": name,
-            "accuracy": float(np.mean(predictions == labels)),
-            "weight_mse": [layer["weight_mse"] for layer in layers],
-            "activation_scales": [layer["input_scale"] for layer in layers],
-        })
-    if include_bittrue:
-        results.extend(bittrue_breakdown(
-            model_path, inputs, labels, batch_size, compiled
-        ))
-    return results
-
-
 def compile_command(args):
-    model_path, model, tensors, _ = load_model(args.model)
-    if "rtl_inputs" not in tensors:
-        raise ValueError("tensor package has no rtl_inputs")
-    rtl_inputs = tensors["rtl_inputs"][args.sample_offset:
-                                        args.sample_offset + args.batch_size]
-    labels = tensors["rtl_labels"][args.sample_offset:
-                                    args.sample_offset + args.batch_size] \
-        if "rtl_labels" in tensors else None
+    model_path, model, _tensors, layers = compile_quantized_layers(args.model)
+    outdir = os.path.abspath(
+        args.outdir or os.path.join(TESTBED_ROOT, "model", "build")
+    )
+    compiled_path = write_compiled_model(outdir, model_path, model, layers)
+    load_compiled_model(compiled_path)
+    print("[PASS] compiled model checksum and target contract verified")
+    print("compiled %d-layer model -> %s" % (len(layers), compiled_path))
+
+
+def emit_test_command(args):
+    compiled = load_compiled_model(args.compiled)
+    _input_path, _input_model, tensors, _input_layers = load_model(args.inputs)
+    if args.input_key not in tensors:
+        raise ValueError("tensor package has no %s" % args.input_key)
+    rtl_inputs = tensors[args.input_key][args.sample_offset:
+                                         args.sample_offset + args.batch_size]
+    labels = None
+    if args.label_key and args.label_key in tensors:
+        labels = tensors[args.label_key][args.sample_offset:
+                                          args.sample_offset + args.batch_size]
     if rtl_inputs.shape[0] != args.batch_size:
         raise ValueError("requested RTL batch is not available")
-    bundle = build_workload(model_path, rtl_inputs, labels)
-    outdir = os.path.abspath(args.outdir or os.path.join(TESTBED_ROOT, "pattern"))
+    bundle = build_workload(
+        args.compiled, rtl_inputs, labels, compiled=compiled
+    )
+    outdir = os.path.abspath(
+        args.outdir or os.path.join(TESTBED_ROOT, "pattern")
+    )
     manifest_path = write_bundle(outdir, bundle)
     replay_bundle(manifest_path)
-    print("[PASS] independent MLP model matches command replay")
+    print("[PASS] compiled model matches command replay")
     print("[PASS] bundle replay matches generated golden")
-    print("generated %d-layer MLP -> %s" % (len(model["layers"]), outdir))
+    print("emitted %d-layer RTL test -> %s" %
+          (len(compiled[2]), outdir))
     print("commands=%d rows=%d/%d/%d" % (
         len(bundle.commands), len(bundle.weight_rows),
         len(bundle.activation_rows), len(bundle.golden_rows),
@@ -1354,90 +1163,48 @@ def replay_command(args):
 
 
 def evaluate_command(args):
-    _, _, tensors, _ = load_model(args.model)
-    if "test_inputs" not in tensors or "test_labels" not in tensors:
-        raise ValueError("tensor package has no full MNIST test set")
-    inputs = tensors["test_inputs"]
-    labels = tensors["test_labels"].astype(np.int64)
-    if args.limit:
-        inputs = inputs[:args.limit]
-        labels = labels[:args.limit]
-    predictions = hardware_inference(args.model, inputs, args.batch_size)
-    accuracy = float(np.mean(predictions == labels))
-    print("hardware-aware accuracy: %.2f%% (%d/%d)" %
-          (accuracy * 100.0, int(np.sum(predictions == labels)), len(labels)))
+    import tpu_reference
+
+    tpu_reference.evaluate_command(args)
 
 
 def ablate_command(args):
-    _, _, tensors, _ = load_model(args.model)
-    if "test_inputs" not in tensors or "test_labels" not in tensors:
-        raise ValueError("tensor package has no full MNIST test set")
-    inputs = tensors["test_inputs"]
-    labels = tensors["test_labels"].astype(np.int64)
-    if args.limit:
-        inputs = inputs[:args.limit]
-        labels = labels[:args.limit]
-    compiled = None
-    calibrated_layers = []
-    if args.include_bittrue:
-        _, _, compiled_tensors, calibrated_layers = compile_quantized_layers(
-            args.model
-        )
-        compiled = compiled_tensors, calibrated_layers
-    results = quantization_ablation(
-        args.model,
-        inputs,
-        labels,
-        batch_size=args.batch_size,
-        include_bittrue=args.include_bittrue,
-        compiled=compiled,
-    )
+    import tpu_reference
 
-    print("Quantization ablation (%d samples)" % len(labels))
-    print("=" * 52)
-    for result in results:
-        print("%-28s %6.2f%%" %
-              (result["name"], result["accuracy"] * 100.0))
-    print("=" * 52)
-    print("Non-bit-true stages use FP64 MAC and FP32 bias without width wrapping.")
-    if calibrated_layers:
-        print("\nCompiler calibration")
-        print("=" * 78)
-        for layer in calibrated_layers:
-            requant = layer.stats["requant"]
-            mismatch = 100.0 * requant["payload_mismatch"] / requant["total"]
-            print(
-                "%-8s in=%-10.4g out=%-10.4g q=%-6d/2^%-2d mismatch=%7.4f%%" %
-                (layer.ir.name, layer.input_scale, layer.output_scale,
-                 layer.qmult, layer.qshift, mismatch)
-            )
-            if requant["rank"]:
-                rank = requant["rank"]
-                agreement = 100.0 * rank["agreement"] / rank["total"]
-                print(
-                    "         rank=%7.4f%% ties=%-4d candidates=%d" %
-                    (agreement, rank["tie_rows"], rank["candidate_count"])
-                )
-        print("=" * 78)
+    tpu_reference.ablate_command(args)
 
 
 def build_parser():
-    parser = argparse.ArgumentParser(description="TPU MLP model compiler")
+    parser = argparse.ArgumentParser(description="Type-2 TPU model compiler")
     subparsers = parser.add_subparsers(dest="command", required=True)
 
-    compile_parser = subparsers.add_parser("compile", help="compile one MLP bundle")
+    compile_parser = subparsers.add_parser(
+        "compile", help="compile and quantize one portable model"
+    )
     compile_parser.add_argument("model", help="model JSON file")
     compile_parser.add_argument("--outdir", default=None)
-    compile_parser.add_argument("--batch-size", type=int, default=32)
-    compile_parser.add_argument("--sample-offset", type=int, default=0)
     compile_parser.set_defaults(function=compile_command)
+
+    emit_parser = subparsers.add_parser(
+        "emit-test", help="emit one RTL test from a compiled model"
+    )
+    emit_parser.add_argument("compiled", help="compiled_model.json file")
+    emit_parser.add_argument(
+        "--inputs", required=True, help="model package containing test inputs"
+    )
+    emit_parser.add_argument("--input-key", default="rtl_inputs")
+    emit_parser.add_argument("--label-key", default="rtl_labels")
+    emit_parser.add_argument("--outdir", default=None)
+    emit_parser.add_argument("--batch-size", type=int, default=32)
+    emit_parser.add_argument("--sample-offset", type=int, default=0)
+    emit_parser.set_defaults(function=emit_test_command)
 
     replay_parser = subparsers.add_parser("replay", help="replay one bundle")
     replay_parser.add_argument("bundle", help="bundle directory or manifest.json")
     replay_parser.set_defaults(function=replay_command)
 
     evaluate_parser = subparsers.add_parser(
-        "evaluate", help="evaluate the hardware model on exported MNIST data"
+        "evaluate", help="evaluate a model with the bit-true reference"
     )
     evaluate_parser.add_argument("model", help="model JSON file")
     evaluate_parser.add_argument("--batch-size", type=int, default=256)

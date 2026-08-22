@@ -4,7 +4,7 @@
 # Run simulation from src/01_RTL.
 # Run synthesis from src/02_SYN.
 #======================================================
-.PHONY: gen_suite check_replay prepare_vectors rtl_regress model_check model_compile model_replay rtl_mnist vcs_rtl vcs_rtl_dump vcs_gate syn clean
+.PHONY: gen_suite check_replay prepare_vectors rtl_regress model_check model_compile model_emit model_replay rtl_mnist vcs_rtl vcs_rtl_dump vcs_gate syn clean
 
 #======================================================
 #              Set your desired file names
@@ -17,6 +17,7 @@ syn_log="syn.log"
 PROFILE ?= regression
 SIM_ARGS ?=
 MODEL ?= model/artifacts/mnist/mnist_mlp.json
+COMPILED_MODEL ?= model/build/compiled_model.json
 MODEL_BATCH ?= 32
 
 #======================================================
@@ -72,12 +73,16 @@ model_check:
 	cd ../00_TESTBED && python3 model/check_compiler.py
 
 model_compile:
-	cd ../00_TESTBED && python3 model/tpu_compiler.py compile ${MODEL} --batch-size ${MODEL_BATCH}
+	cd ../00_TESTBED && python3 model/tpu_compiler.py compile ${MODEL} --outdir model/build
 
-model_replay:
+model_emit: model_compile
+	cd ../00_TESTBED && python3 model/tpu_compiler.py emit-test ${COMPILED_MODEL} --inputs ${MODEL} --batch-size ${MODEL_BATCH}
+
+model_replay: model_emit
 	cd ../00_TESTBED && python3 model/tpu_compiler.py replay pattern
 
-rtl_mnist: model_compile model_replay vcs_rtl
+rtl_mnist: model_replay
+	${VCS_RTL}
 
 vcs_rtl_dump:
 	${VCS_RTL_DUMP}
