@@ -126,6 +126,13 @@ Add `--include-bittrue` to append these progressive hardware stages:
 The first stage whose accuracy decreases identifies the hardware rule that
 needs investigation.
 
+Compiler calibration uses percentile/MSE selection for the A5 scale. For each
+layer, it derives the hardware multiplier from
+`input_scale * weight_scale / (2 * output_scale)` and encodes it into the legal
+18-bit `QMULT` and 6-bit `QSHIFT` fields. The ablation report also prints the
+per-layer scales, encoded multiplier and mismatch rate between ideal A5
+payloads and hardware requantized payloads.
+
 ## RTL Simulation
 
 After uploading the exported JSON and NPZ package, run from `src/01_RTL`:

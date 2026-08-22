@@ -154,6 +154,30 @@ def quantize_activation(values, scale):
     return (signed_code & 0xF).astype(np.uint8)
 
 
+def choose_a5_scale(values):
+    values = np.asarray(values, dtype=np.float64)
+    magnitude = np.abs(values[np.isfinite(values)])
+    if magnitude.size == 0 or float(np.max(magnitude)) == 0.0:
+        return 1.0e-12
+
+    percentiles = (90.0, 95.0, 97.0, 98.0, 99.0, 99.5,
+                   99.9, 99.95, 99.99, 100.0)
+    best_scale = None
+    best_error = None
+    for percentile in percentiles:
+        clip = float(np.percentile(magnitude, percentile))
+        if clip <= 0.0:
+            continue
+        scale = clip / 15.0
+        payload = quantize_activation(values, scale)
+        reconstructed = decode_activation_np(payload) * scale
+        error = float(np.mean((reconstructed - values) ** 2))
+        if best_error is None or error < best_error:
+            best_scale = scale
+            best_error = error
+    return best_scale
+
+
 def activation_stats(values, scale):
     target = np.asarray(values, dtype=np.float64) / float(scale)
     unbounded = round_half_up((target - 1.0) / 2.0)
@@ -248,17 +272,13 @@ def exact_accumulate(payload, raw_weight, bias_acc, k_dim):
     return accumulator
 
 
-def choose_requant(accumulator, act_mode):
-    values = np.asarray(accumulator, dtype=np.int64)
-    if act_mode == tc.ACT_RELU:
-        peak = int(max(0, int(np.max(values)))) if values.size else 0
-    else:
-        peak = int(np.max(np.abs(values))) if values.size else 0
-    if peak == 0:
-        return 1, 0
-
-    factor = 7.0 / float(peak)
+def encode_requant_factor(factor):
+    if not math.isfinite(factor) or factor <= 0.0:
+        raise ValueError("requant factor must be finite and positive")
     maximum = (1 << (tc.QMULT_W - 1)) - 1
+    if factor > maximum:
+        raise ValueError("requant factor exceeds QMULT range")
+
     ratio = maximum / factor
     qshift = math.floor(math.log2(ratio)) if ratio >= 1.0 else 0
     qshift = min(max(qshift, 0), (1 << tc.QSHIFT_W) - 1)
@@ -266,7 +286,9 @@ def choose_requant(accumulator, act_mode):
     while qmult > maximum and qshift > 0:
         qshift -= 1
         qmult = int(round_half_up(factor * (1 << qshift)))
-    return min(max(qmult, 1), maximum), qshift
+    if qmult < 1:
+        raise ValueError("requant factor is smaller than descriptor precision")
+    return qmult, qshift
 
 
 def output_payload_np(accumulator, qmult, qshift, act_mode):
@@ -354,7 +376,7 @@ def compile_quantized_layers(model_path):
             calibration_float.shape[1] != model["input_features"]):
         raise ValueError("calibration input shape mismatch")
 
-    input_scale = derive_activation_scale(calibration_float)
+    input_scale = choose_a5_scale(calibration_float)
     calibration_payload = quantize_activation(calibration_float, input_scale)
     quantized_layers = []
 
@@ -374,20 +396,47 @@ def compile_quantized_layers(model_path):
             layer.in_features,
         )
         act_mode = tc.ACT_RELU if layer.activation == "relu" else tc.ACT_NONE
-        qmult, qshift = choose_requant(accumulator, act_mode)
+
+        activation_float = decode_activation_np(
+            calibration_payload
+        ).astype(np.float64) * input_scale
+        effective_weight = effective_weight_np(
+            raw_weight_nk
+        ).astype(np.float64) * weight_scale
+        reference = np.matmul(activation_float, effective_weight.T) + bias
+        if act_mode == tc.ACT_RELU:
+            reference = np.maximum(reference, 0.0)
+
+        output_scale = choose_a5_scale(reference)
+        requant_factor = accumulator_scale / (2.0 * output_scale)
+        qmult, qshift = encode_requant_factor(requant_factor)
         output_payload, output_stats = output_payload_np(
             accumulator, qmult, qshift, act_mode
         )
-
-        reference = np.matmul(calibration_float, weight.T) + bias
-        if act_mode == tc.ACT_RELU:
-            reference = np.maximum(reference, 0.0)
-        output_scale = fit_output_scale(reference, output_payload)
+        ideal_payload = quantize_activation(reference, output_scale)
+        reconstructed = decode_activation_np(
+            output_payload
+        ).astype(np.float64) * output_scale
+        encoded_factor = qmult / float(1 << qshift)
         stats = {
             "activation": activation_stats(calibration_float, input_scale),
             "weight": weight_stats,
             "bias": bias_stats,
             "output": output_stats,
+            "requant": {
+                "target_factor": requant_factor,
+                "encoded_factor": encoded_factor,
+                "relative_factor_error": abs(
+                    encoded_factor - requant_factor
+                ) / requant_factor,
+                "payload_mismatch": int(np.count_nonzero(
+                    output_payload != ideal_payload
+                )),
+                "total": int(output_payload.size),
+                "reconstruction_mse": float(np.mean(
+                    (reconstructed - reference) ** 2
+                )),
+            },
             "accumulator_min": int(np.min(accumulator)),
             "accumulator_max": int(np.max(accumulator)),
             "accumulator_worst_case_bound": worst_accumulator,
@@ -938,12 +987,15 @@ def fake_quant_activation(values, scale, codebook, relu):
 
 def choose_fake_scale(values, codebook, relu):
     values = np.asarray(values, dtype=np.float64)
+    if codebook == "fixed_lsb":
+        return choose_a5_scale(values)
+
     magnitude = values if relu else np.abs(values)
     magnitude = magnitude[np.isfinite(magnitude)]
     if magnitude.size == 0 or float(np.max(magnitude)) == 0.0:
         return 1.0e-12
 
-    maximum_level = 7.0 if codebook == "int4" else 15.0
+    maximum_level = 7.0
     percentiles = (90.0, 95.0, 97.0, 98.0, 99.0, 99.5,
                    99.9, 99.95, 99.99, 100.0)
     best_scale = None
@@ -1144,10 +1196,12 @@ def progressive_integer_inference(model_path, inputs, mode, batch_size=512,
     return np.asarray(predictions, dtype=np.int64)
 
 
-def bittrue_breakdown(model_path, inputs, labels, batch_size=512):
+def bittrue_breakdown(model_path, inputs, labels, batch_size=512,
+                      compiled=None):
     labels = np.asarray(labels, dtype=np.int64)
-    _, _, tensors, layers = compile_quantized_layers(model_path)
-    compiled = tensors, layers
+    if compiled is None:
+        _, _, tensors, layers = compile_quantized_layers(model_path)
+        compiled = tensors, layers
     stages = []
     predictions = compiler_scale_float_inference(
         model_path, inputs, batch_size, compiled
@@ -1178,7 +1232,7 @@ def bittrue_breakdown(model_path, inputs, labels, batch_size=512):
 
 
 def quantization_ablation(model_path, inputs, labels, batch_size=512,
-                          include_bittrue=False):
+                          include_bittrue=False, compiled=None):
     stages = [
         ("FP32", "fp32", None),
         ("INT8-W", "int8", None),
@@ -1200,7 +1254,7 @@ def quantization_ablation(model_path, inputs, labels, batch_size=512,
         })
     if include_bittrue:
         results.extend(bittrue_breakdown(
-            model_path, inputs, labels, batch_size
+            model_path, inputs, labels, batch_size, compiled
         ))
     return results
 
@@ -1259,12 +1313,20 @@ def ablate_command(args):
     if args.limit:
         inputs = inputs[:args.limit]
         labels = labels[:args.limit]
+    compiled = None
+    calibrated_layers = []
+    if args.include_bittrue:
+        _, _, compiled_tensors, calibrated_layers = compile_quantized_layers(
+            args.model
+        )
+        compiled = compiled_tensors, calibrated_layers
     results = quantization_ablation(
         args.model,
         inputs,
         labels,
         batch_size=args.batch_size,
         include_bittrue=args.include_bittrue,
+        compiled=compiled,
     )
 
     print("Quantization ablation (%d samples)" % len(labels))
@@ -1274,6 +1336,18 @@ def ablate_command(args):
               (result["name"], result["accuracy"] * 100.0))
     print("=" * 52)
     print("Non-bit-true stages use FP64 MAC and FP32 bias without width wrapping.")
+    if calibrated_layers:
+        print("\nCompiler calibration")
+        print("=" * 78)
+        for layer in calibrated_layers:
+            requant = layer.stats["requant"]
+            mismatch = 100.0 * requant["payload_mismatch"] / requant["total"]
+            print(
+                "%-8s in=%-10.4g out=%-10.4g q=%-6d/2^%-2d mismatch=%7.4f%%" %
+                (layer.ir.name, layer.input_scale, layer.output_scale,
+                 layer.qmult, layer.qshift, mismatch)
+            )
+        print("=" * 78)
 
 
 def build_parser():

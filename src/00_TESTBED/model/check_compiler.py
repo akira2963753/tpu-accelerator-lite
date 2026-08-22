@@ -109,6 +109,13 @@ def main():
         check_manifest(manifest)
         checks.append(("bundle files and checksums", True))
         checks.append(("complete MNIST MLP topology", True))
+        checks.append((
+            "scale-aware requant calibration",
+            all(
+                layer["stats"]["requant"]["relative_factor_error"] < 1.0e-4
+                for layer in manifest["layers"]
+            ),
+        ))
 
         predictions = compiler.hardware_inference(
             model_path, tensors["rtl_inputs"], batch_size=11
