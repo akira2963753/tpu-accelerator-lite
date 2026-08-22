@@ -115,6 +115,23 @@ def main():
         )
         checks.append(("batched hardware inference", predictions.shape == (32,)))
 
+        ablation = compiler.quantization_ablation(
+            model_path,
+            tensors["rtl_inputs"][:8],
+            tensors["rtl_labels"][:8],
+            batch_size=4,
+        )
+        checks.append((
+            "non-bit-true quantization ablation",
+            [stage["name"] for stage in ablation] == [
+                "FP32",
+                "INT8-W",
+                "Type2-W",
+                "Type2-W + INT4-A",
+                "Type2-W + FixedLSB-A",
+            ],
+        ))
+
     print("TPU model compiler self-check")
     for name, passed in checks:
         print("[%s] %s" % ("PASS" if passed else "FAIL", name))

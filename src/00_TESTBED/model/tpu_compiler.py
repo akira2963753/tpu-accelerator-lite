@@ -902,6 +902,162 @@ def hardware_inference(model_path, inputs, batch_size=256):
     return np.asarray(predictions, dtype=np.int64)
 
 
+def fake_weight(weight, mode):
+    weight = np.asarray(weight, dtype=np.float64)
+    if mode == "fp32":
+        return weight.copy()
+
+    raw, effective_scale, stats = quantize_weight(weight)
+    if mode == "int8":
+        signed_raw = np.where(raw.astype(np.int64) >= 128,
+                              raw.astype(np.int64) - 256,
+                              raw.astype(np.int64))
+        return signed_raw.astype(np.float64) * stats["raw_scale"]
+    if mode == "type2":
+        return effective_weight_np(raw).astype(np.float64) * effective_scale
+    raise ValueError("unsupported fake weight mode %s" % mode)
+
+
+def fake_quant_activation(values, scale, codebook, relu):
+    values = np.asarray(values, dtype=np.float64)
+    if scale <= 0.0:
+        raise ValueError("fake quant scale must be positive")
+
+    if codebook == "int4":
+        quantized = round_half_up(values / scale)
+        minimum = 0 if relu else -8
+        quantized = np.clip(quantized, minimum, 7)
+        return quantized * scale
+    if codebook == "fixed_lsb":
+        quantized = round_half_up((values / scale - 1.0) / 2.0)
+        minimum = 0 if relu else -8
+        quantized = np.clip(quantized, minimum, 7)
+        return (quantized * 2.0 + 1.0) * scale
+    raise ValueError("unsupported activation codebook %s" % codebook)
+
+
+def choose_fake_scale(values, codebook, relu):
+    values = np.asarray(values, dtype=np.float64)
+    magnitude = values if relu else np.abs(values)
+    magnitude = magnitude[np.isfinite(magnitude)]
+    if magnitude.size == 0 or float(np.max(magnitude)) == 0.0:
+        return 1.0e-12
+
+    maximum_level = 7.0 if codebook == "int4" else 15.0
+    percentiles = (90.0, 95.0, 97.0, 98.0, 99.0, 99.5,
+                   99.9, 99.95, 99.99, 100.0)
+    best_scale = None
+    best_error = None
+    for percentile in percentiles:
+        clip = float(np.percentile(magnitude, percentile))
+        if clip <= 0.0:
+            continue
+        scale = clip / maximum_level
+        reconstructed = fake_quant_activation(values, scale, codebook, relu)
+        error = float(np.mean((reconstructed - values) ** 2))
+        if best_error is None or error < best_error:
+            best_scale = scale
+            best_error = error
+    return best_scale
+
+
+def prepare_fake_model(model_path, weight_mode, activation_codebook=None):
+    _, model, tensors, layers = load_model(model_path)
+    calibration = np.asarray(tensors["calibration_inputs"], dtype=np.float64)
+    fake_layers = []
+    input_relu = False
+    input_scale = choose_fake_scale(
+        calibration, activation_codebook, input_relu
+    ) if activation_codebook else None
+
+    for layer_index, ir in enumerate(layers):
+        weight = np.asarray(tensors[ir.weight_key], dtype=np.float64)
+        bias = np.asarray(tensors[ir.bias_key], dtype=np.float64) \
+            if ir.bias_key else np.zeros(ir.out_features, dtype=np.float64)
+        reduced_weight = fake_weight(weight, weight_mode)
+        layer_input = fake_quant_activation(
+            calibration, input_scale, activation_codebook, input_relu
+        ) if activation_codebook else calibration
+        output = np.matmul(layer_input, reduced_weight.T) + bias
+        output_relu = ir.activation == "relu"
+        if output_relu:
+            output = np.maximum(output, 0.0)
+
+        next_scale = None
+        if activation_codebook and layer_index != len(layers) - 1:
+            next_scale = choose_fake_scale(
+                output, activation_codebook, output_relu
+            )
+        fake_layers.append({
+            "ir": ir,
+            "weight": reduced_weight,
+            "bias": bias,
+            "input_scale": input_scale,
+            "input_relu": input_relu,
+            "weight_mse": float(np.mean((reduced_weight - weight) ** 2)),
+        })
+        calibration = output
+        input_scale = next_scale
+        input_relu = output_relu
+    return model, tensors, fake_layers
+
+
+def fake_inference(model_path, inputs, weight_mode, activation_codebook=None,
+                   batch_size=512):
+    _, _, layers = prepare_fake_model(
+        model_path, weight_mode, activation_codebook
+    )
+    inputs = np.asarray(inputs, dtype=np.float64)
+    predictions = []
+    for base in range(0, inputs.shape[0], batch_size):
+        values = inputs[base:base + batch_size]
+        for layer in layers:
+            if activation_codebook:
+                values = fake_quant_activation(
+                    values,
+                    layer["input_scale"],
+                    activation_codebook,
+                    layer["input_relu"],
+                )
+            values = np.matmul(values, layer["weight"].T) + layer["bias"]
+            if layer["ir"].activation == "relu":
+                values = np.maximum(values, 0.0)
+        predictions.extend(np.argmax(values, axis=1).tolist())
+    return np.asarray(predictions, dtype=np.int64), layers
+
+
+def quantization_ablation(model_path, inputs, labels, batch_size=512,
+                          include_bittrue=False):
+    stages = [
+        ("FP32", "fp32", None),
+        ("INT8-W", "int8", None),
+        ("Type2-W", "type2", None),
+        ("Type2-W + INT4-A", "type2", "int4"),
+        ("Type2-W + FixedLSB-A", "type2", "fixed_lsb"),
+    ]
+    labels = np.asarray(labels, dtype=np.int64)
+    results = []
+    for name, weight_mode, codebook in stages:
+        predictions, layers = fake_inference(
+            model_path, inputs, weight_mode, codebook, batch_size
+        )
+        results.append({
+            "name": name,
+            "accuracy": float(np.mean(predictions == labels)),
+            "weight_mse": [layer["weight_mse"] for layer in layers],
+            "activation_scales": [layer["input_scale"] for layer in layers],
+        })
+    if include_bittrue:
+        predictions = hardware_inference(model_path, inputs, batch_size)
+        results.append({
+            "name": "Bit-true TPU",
+            "accuracy": float(np.mean(predictions == labels)),
+            "weight_mse": None,
+            "activation_scales": None,
+        })
+    return results
+
+
 def compile_command(args):
     model_path, model, tensors, _ = load_model(args.model)
     if "rtl_inputs" not in tensors:
@@ -947,6 +1103,32 @@ def evaluate_command(args):
           (accuracy * 100.0, int(np.sum(predictions == labels)), len(labels)))
 
 
+def ablate_command(args):
+    _, _, tensors, _ = load_model(args.model)
+    if "test_inputs" not in tensors or "test_labels" not in tensors:
+        raise ValueError("tensor package has no full MNIST test set")
+    inputs = tensors["test_inputs"]
+    labels = tensors["test_labels"].astype(np.int64)
+    if args.limit:
+        inputs = inputs[:args.limit]
+        labels = labels[:args.limit]
+    results = quantization_ablation(
+        args.model,
+        inputs,
+        labels,
+        batch_size=args.batch_size,
+        include_bittrue=args.include_bittrue,
+    )
+
+    print("Quantization ablation (%d samples)" % len(labels))
+    print("=" * 52)
+    for result in results:
+        print("%-28s %6.2f%%" %
+              (result["name"], result["accuracy"] * 100.0))
+    print("=" * 52)
+    print("Non-bit-true stages use FP64 MAC and FP32 bias without width wrapping.")
+
+
 def build_parser():
     parser = argparse.ArgumentParser(description="TPU MLP model compiler")
     subparsers = parser.add_subparsers(dest="command", required=True)
@@ -969,6 +1151,15 @@ def build_parser():
     evaluate_parser.add_argument("--batch-size", type=int, default=256)
     evaluate_parser.add_argument("--limit", type=int, default=0)
     evaluate_parser.set_defaults(function=evaluate_command)
+
+    ablate_parser = subparsers.add_parser(
+        "ablate", help="compare non-bit-true quantization stages"
+    )
+    ablate_parser.add_argument("model", help="model JSON file")
+    ablate_parser.add_argument("--batch-size", type=int, default=512)
+    ablate_parser.add_argument("--limit", type=int, default=0)
+    ablate_parser.add_argument("--include-bittrue", action="store_true")
+    ablate_parser.set_defaults(function=ablate_command)
     return parser
 
 

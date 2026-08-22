@@ -101,6 +101,18 @@ This accuracy includes activation quantization, WPU Type-2 weight reduction,
 fixed activation LSB reconstruction, 21-bit PSUM wrapping, 29-bit ACC wrapping,
 bias, requantization and activation mode.
 
+Before bit-true analysis, run the non-bit-true quantization ablation:
+
+```sh
+python3 model/tpu_compiler.py ablate \
+    model/artifacts/mnist/mnist_mlp.json
+```
+
+It reports FP32, INT8 weight, Type-2 weight, ordinary INT4 activation and fixed
+LSB activation accuracy. These stages use floating-point MAC and bias without
+PSUM/ACC wrapping or integer `QMULT/QSHIFT`. Add `--include-bittrue` to append
+the complete hardware-aware result to the same table.
+
 ## RTL Simulation
 
 After uploading the exported JSON and NPZ package, run from `src/01_RTL`:
