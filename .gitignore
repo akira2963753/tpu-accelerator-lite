@@ -34,6 +34,10 @@ alib-*/
 __pycache__/
 *.pyc
 
+# ---- model training artifacts --------------------------------------------
+*.pth
+model/**/data/
+
 # ---- LaTeX spec build -----------------------------------------------------
 spec/build/
 *.aux

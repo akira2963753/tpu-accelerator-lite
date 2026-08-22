@@ -123,7 +123,7 @@ def print_model_summary(model, input_size=(1, 1, 28, 28)):
     print("LeNet Architecture Summary:")
     print("=" * 50)
 
-    dummy_input = torch.randn(input_size)
+    dummy_input = torch.randn(input_size, device=next(model.parameters()).device)
 
     print(f"Input shape: {dummy_input.shape}")
 

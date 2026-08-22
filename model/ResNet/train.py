@@ -184,7 +184,7 @@ def print_model_summary(model, input_size=(1, 1, 28, 28)):
     print(f"Total Fully Connected Layers: {fc_layers}")
     print(f"Total Trainable Layers: {conv_layers + fc_layers}")
 
-    dummy_input = torch.randn(input_size)
+    dummy_input = torch.randn(input_size, device=next(model.parameters()).device)
 
     print(f"\nInput shape: {dummy_input.shape}")
 
