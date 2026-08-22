@@ -56,7 +56,7 @@ set CYCLE 2
 sh mkdir -p Netlist
 sh mkdir -p Report
 sh mkdir -p Work
-define_design_lib $DESIGN -path Work
+define_design_lib WORK -path Work
 
 #=================================================================
 #----------------- Analyze and Elaborate Design ------------------
@@ -68,12 +68,6 @@ current_design $DESIGN
 #=================================================================
 #------------------- Set Operating Conditions --------------------
 #=================================================================
-set_min_library N16ADFP_StdCellss0p72vm40c_ccs.db \
-    -min_version N16ADFP_StdCellff0p88v125c_ccs.db
-
-set_min_library N16ADFP_SRAM_ss0p72v0p72vm40c_100a.db \
-    -min_version N16ADFP_SRAM_ff0p88v0p88vm40c_100a.db
-
 set_operating_conditions \
     -max_library N16ADFP_StdCellss0p72vm40c_ccs \
     -max ss0p72vm40c \

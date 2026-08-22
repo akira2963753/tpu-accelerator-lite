@@ -57,6 +57,11 @@ module TPU (
     logic [`A_BW-1:0] op_data;
     logic [`R_BW-1:0] op_r_data;
     logic [`R_BW-1:0] ub_r_data;
+
+    // TFLite's Quantize Multiplier :
+    // Yi = (Wi * Ai) * (Sw * Sa) / Sy 
+    // M = Sw * Sa / Sy encode as qmult / 2^qshift
+
     logic [`QMULT_W-1:0] qmult_q;
     logic [`QSHIFT_W-1:0] qshift_q;
 
@@ -68,14 +73,8 @@ module TPU (
     genvar i;
     generate
         for(i = 0; i < `ARRAY_S; i++) begin : OUTPUT_FORMAT
-            assign op_r_data[`R_W*i +: `R_W] = {
-                op_data[`A_W*i +: `A_W],
-                {(`R_W-`A_W){1'b0}}
-            };
-            assign ub_r_data[`R_W*i +: `R_W] = {
-                ub_data_o[`A_W*i +: `A_W],
-                {(`R_W-`A_W){1'b0}}
-            };
+            assign op_r_data[`R_W*i +: `R_W] = {op_data[`A_W*i +: `A_W], {(`R_W-`A_W){1'b0}}};
+            assign ub_r_data[`R_W*i +: `R_W] = {ub_data_o[`A_W*i +: `A_W], {(`R_W-`A_W){1'b0}}};
         end
     endgenerate
 
