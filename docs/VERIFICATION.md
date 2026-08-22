@@ -140,7 +140,7 @@ The final RTL pass/fail result is determined only by Server simulation.
 ## MNIST MLP Flow
 
 The model compiler keeps the directed suite intact and replaces only the active
-files under `pattern/`. See `docs/MODEL_COMPILER.md` for training and export.
+files under `pattern/`. See `docs/MODEL_COMPILER.md` for checkpoint export.
 
 Run the compiler self-check and generate the complete three-layer MLP from
 `src/00_TESTBED`:

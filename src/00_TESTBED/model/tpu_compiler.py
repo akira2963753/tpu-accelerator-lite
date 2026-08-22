@@ -503,8 +503,16 @@ def build_workload(model_path, rtl_inputs, rtl_labels=None):
         ir = layer.ir
         kt_total = ceil_div(ir.in_features, target.array_size)
         nt_total = ceil_div(ir.out_features, target.array_size)
-        if kt_total * nt_total > target.wmem_slots:
-            raise ValueError("layer %s exceeds resident WMEM capacity" % ir.name)
+        nt_block_capacity = target.wmem_slots // kt_total
+        if nt_block_capacity == 0:
+            raise ValueError("layer %s K tiles exceed WMEM capacity" % ir.name)
+        nt_block_capacity = min(nt_total, nt_block_capacity)
+        weight_blocks = []
+        for nt_begin in range(0, nt_total, nt_block_capacity):
+            weight_blocks.append({
+                "nt_begin": nt_begin,
+                "nt_count": min(nt_block_capacity, nt_total - nt_begin),
+            })
         if len(input_slots) != mt_total * kt_total:
             raise ValueError("UB input tile layout does not match layer %s" % ir.name)
 
@@ -520,19 +528,6 @@ def build_workload(model_path, rtl_inputs, rtl_labels=None):
         padded_bias[:ir.out_features] = layer.bias_acc
 
         layer_start = len(commands)
-        for nt in range(nt_total):
-            for kt in range(kt_total):
-                w_slot = kt * nt_total + nt
-                command = tc.make_command(
-                    tc.CMD_OP_LOAD_W,
-                    kt=kt,
-                    nt=nt,
-                    w_slot=w_slot,
-                )
-                commands.append(command)
-                command_ir.append(CommandIR(ir.name, "LOAD_W", command.word))
-                weight_rows.extend(pack_weight_tile_np(padded_weight, kt, nt))
-
         if layer_index == 0:
             for mt in range(mt_total):
                 for kt in range(kt_total):
@@ -560,57 +555,81 @@ def build_workload(model_path, rtl_inputs, rtl_labels=None):
             layer.act_mode,
         )
 
-        for nt in range(nt_total):
-            if ir.bias_key:
-                bias = padded_bias[nt * target.array_size:(nt + 1) * target.array_size]
-                command = tc.make_command(tc.CMD_OP_LOAD_BIAS, nt=nt)
-                commands.append(command)
-                command_ir.append(CommandIR(ir.name, "LOAD_BIAS", command.word))
-                weight_rows.extend(tg.pack_bias([int(value) for value in bias]))
-
-            for mt in range(mt_total):
+        for block in weight_blocks:
+            nt_begin = block["nt_begin"]
+            nt_count = block["nt_count"]
+            for local_nt in range(nt_count):
+                nt = nt_begin + local_nt
                 for kt in range(kt_total):
-                    w_slot = kt * nt_total + nt
-                    src_slot = input_slots[mt * kt_total + kt]
+                    w_slot = kt * nt_count + local_nt
                     command = tc.make_command(
-                        tc.CMD_OP_PRELOAD_W,
-                        mt=mt,
+                        tc.CMD_OP_LOAD_W,
                         kt=kt,
                         nt=nt,
                         w_slot=w_slot,
                     )
                     commands.append(command)
-                    command_ir.append(CommandIR(ir.name, "PRELOAD_W", command.word))
-                    command = tc.make_command(
-                        tc.CMD_OP_GEMM,
-                        mt=mt,
-                        kt=kt,
-                        nt=nt,
-                        w_slot=w_slot,
-                        src_slot=src_slot,
-                        acc_init=(kt == 0),
-                        acc_final=(kt == kt_total - 1),
-                        k_valid=min(target.array_size,
-                                    ir.in_features - kt * target.array_size),
-                        bias_en=(kt == 0 and bool(ir.bias_key)),
-                    )
-                    commands.append(command)
-                    command_ir.append(CommandIR(ir.name, "GEMM", command.word))
+                    command_ir.append(CommandIR(ir.name, "LOAD_W", command.word))
+                    weight_rows.extend(pack_weight_tile_np(padded_weight, kt, nt))
 
-                dst_slot = output_slots[mt * nt_total + nt]
-                command = tc.make_command(
-                    tc.CMD_OP_STORE_C,
-                    qmult=layer.qmult,
-                    qshift=layer.qshift,
-                    mt=mt,
-                    kt=kt_total - 1,
-                    nt=nt,
-                    dst_slot=dst_slot,
-                    act_mode=layer.act_mode,
-                )
-                commands.append(command)
-                command_ir.append(CommandIR(ir.name, "STORE_C", command.word))
-                golden_rows.extend(pack_output_tile_np(output, mt, nt))
+            for local_nt in range(nt_count):
+                nt = nt_begin + local_nt
+                if ir.bias_key:
+                    bias = padded_bias[
+                        nt * target.array_size:(nt + 1) * target.array_size
+                    ]
+                    command = tc.make_command(tc.CMD_OP_LOAD_BIAS, nt=nt)
+                    commands.append(command)
+                    command_ir.append(CommandIR(ir.name, "LOAD_BIAS", command.word))
+                    weight_rows.extend(tg.pack_bias([int(value) for value in bias]))
+
+                for mt in range(mt_total):
+                    for kt in range(kt_total):
+                        w_slot = kt * nt_count + local_nt
+                        src_slot = input_slots[mt * kt_total + kt]
+                        command = tc.make_command(
+                            tc.CMD_OP_PRELOAD_W,
+                            mt=mt,
+                            kt=kt,
+                            nt=nt,
+                            w_slot=w_slot,
+                        )
+                        commands.append(command)
+                        command_ir.append(CommandIR(
+                            ir.name, "PRELOAD_W", command.word
+                        ))
+                        command = tc.make_command(
+                            tc.CMD_OP_GEMM,
+                            mt=mt,
+                            kt=kt,
+                            nt=nt,
+                            w_slot=w_slot,
+                            src_slot=src_slot,
+                            acc_init=(kt == 0),
+                            acc_final=(kt == kt_total - 1),
+                            k_valid=min(
+                                target.array_size,
+                                ir.in_features - kt * target.array_size,
+                            ),
+                            bias_en=(kt == 0 and bool(ir.bias_key)),
+                        )
+                        commands.append(command)
+                        command_ir.append(CommandIR(ir.name, "GEMM", command.word))
+
+                    dst_slot = output_slots[mt * nt_total + nt]
+                    command = tc.make_command(
+                        tc.CMD_OP_STORE_C,
+                        qmult=layer.qmult,
+                        qshift=layer.qshift,
+                        mt=mt,
+                        kt=kt_total - 1,
+                        nt=nt,
+                        dst_slot=dst_slot,
+                        act_mode=layer.act_mode,
+                    )
+                    commands.append(command)
+                    command_ir.append(CommandIR(ir.name, "STORE_C", command.word))
+                    golden_rows.extend(pack_output_tile_np(output, mt, nt))
 
         valid_output = output[:m_dim, :ir.out_features].copy()
         independent_outputs.append(valid_output)
@@ -627,7 +646,9 @@ def build_workload(model_path, rtl_inputs, rtl_labels=None):
             "output_scale": layer.output_scale,
             "input_slots": input_slots,
             "output_slots": output_slots,
-            "weight_slots": kt_total * nt_total,
+            "weight_tiles": kt_total * nt_total,
+            "weight_slots": kt_total * nt_block_capacity,
+            "weight_blocks": weight_blocks,
             "command_begin": layer_start,
             "command_count": len(commands) - layer_start,
             "stats": dict(layer.stats, rtl_output=rtl_output_stats),

@@ -1,10 +1,9 @@
 #!/usr/bin/env python3
-"""Train or load the reference MNIST MLP and export compiler inputs."""
+"""Export the trained project MNIST MLP for TPU inference."""
 
 import argparse
 import json
 import os
-import random
 
 import numpy as np
 
@@ -12,39 +11,77 @@ import numpy as np
 MODEL_FORMAT = "tpu-mlp-v1"
 MNIST_MEAN = 0.1307
 MNIST_STD = 0.3081
+CHECKPOINT_NAME = "mnist_mlp_model.pth"
 
 
 def require_torch():
     try:
         import torch
-        import torch.nn as nn
+        from torch import nn
         import torchvision
-        import torchvision.transforms as transforms
+        from torchvision import transforms
     except ImportError as error:
         raise SystemExit(
-            "PyTorch and torchvision are required only for MNIST export"
+            "PyTorch and torchvision are required only for checkpoint export"
         ) from error
     return torch, nn, torchvision, transforms
 
 
 def build_model(nn):
-    class MNISTMLP(nn.Module):
+    class MLP(nn.Module):
         def __init__(self):
             super().__init__()
-            self.fc1 = nn.Linear(784, 256)
-            self.fc2 = nn.Linear(256, 128)
-            self.fc3 = nn.Linear(128, 10)
+            self.fc1 = nn.Linear(784, 512)
+            self.fc2 = nn.Linear(512, 256)
+            self.fc3 = nn.Linear(256, 10)
+            self.dropout = nn.Dropout(0.2)
 
         def forward(self, inputs):
             inputs = inputs.reshape(inputs.shape[0], 784)
             inputs = nn.functional.relu(self.fc1(inputs))
+            inputs = self.dropout(inputs)
             inputs = nn.functional.relu(self.fc2(inputs))
+            inputs = self.dropout(inputs)
             return self.fc3(inputs)
 
-    return MNISTMLP()
+    return MLP()
 
 
-def collect_inputs(loader, count, torch):
+def find_checkpoint(checkpoint):
+    if checkpoint:
+        path = os.path.abspath(checkpoint)
+        if not os.path.isfile(path):
+            raise FileNotFoundError(path)
+        return path
+
+    project_root = os.path.normpath(os.path.join(
+        os.path.dirname(os.path.abspath(__file__)), "..", "..", ".."
+    ))
+    candidates = [
+        os.path.join(os.getcwd(), CHECKPOINT_NAME),
+        os.path.join(project_root, "model", "MLP", CHECKPOINT_NAME),
+    ]
+    for path in candidates:
+        if os.path.isfile(path):
+            return path
+    raise FileNotFoundError(
+        "missing %s; pass --checkpoint or copy it to model/MLP" %
+        CHECKPOINT_NAME
+    )
+
+
+def load_checkpoint(model, checkpoint, device, torch):
+    try:
+        state = torch.load(checkpoint, map_location=device, weights_only=True)
+    except TypeError:
+        state = torch.load(checkpoint, map_location=device)
+    if isinstance(state, dict) and "state_dict" in state:
+        state = state["state_dict"]
+    model.load_state_dict(state, strict=True)
+    model.eval()
+
+
+def collect_inputs(loader, count):
     inputs = []
     labels = []
     collected = 0
@@ -63,7 +100,7 @@ def collect_inputs(loader, count, torch):
     )
 
 
-def collect_balanced_rtl_batch(dataset, torch, count=32):
+def collect_balanced_rtl_batch(dataset, count=32):
     quotas = [count // 10 + (1 if digit < count % 10 else 0) for digit in range(10)]
     selected_inputs = []
     selected_labels = []
@@ -76,8 +113,10 @@ def collect_balanced_rtl_batch(dataset, torch, count=32):
             used[digit] += 1
         if len(selected_inputs) == count:
             break
-    return (np.asarray(selected_inputs, dtype=np.float32),
-            np.asarray(selected_labels, dtype=np.int64))
+    return (
+        np.asarray(selected_inputs, dtype=np.float32),
+        np.asarray(selected_labels, dtype=np.int64),
+    )
 
 
 def evaluate(model, loader, device, torch):
@@ -94,32 +133,12 @@ def evaluate(model, loader, device, torch):
     return correct / total
 
 
-def train(model, loader, device, epochs, learning_rate, torch, nn):
-    optimizer = torch.optim.Adam(model.parameters(), lr=learning_rate)
-    criterion = nn.CrossEntropyLoss()
-    model.train()
-    for epoch in range(epochs):
-        total_loss = 0.0
-        total_samples = 0
-        for inputs, labels in loader:
-            inputs = inputs.to(device)
-            labels = labels.to(device)
-            optimizer.zero_grad()
-            loss = criterion(model(inputs), labels)
-            loss.backward()
-            optimizer.step()
-            total_loss += float(loss.item()) * int(labels.numel())
-            total_samples += int(labels.numel())
-        print("epoch %d/%d loss=%.6f" %
-              (epoch + 1, epochs, total_loss / total_samples))
-
-
-def export_package(model, train_loader, test_loader, test_dataset, outdir,
-                   calibration_count, rtl_count, torch):
+def export_package(model, calibration_loader, test_loader, test_dataset,
+                   outdir, calibration_count, rtl_count):
     os.makedirs(outdir, exist_ok=True)
-    calibration_inputs, _ = collect_inputs(train_loader, calibration_count, torch)
-    test_inputs, test_labels = collect_inputs(test_loader, len(test_dataset), torch)
-    rtl_inputs, rtl_labels = collect_balanced_rtl_batch(test_dataset, torch, rtl_count)
+    calibration_inputs, _ = collect_inputs(calibration_loader, calibration_count)
+    test_inputs, test_labels = collect_inputs(test_loader, len(test_dataset))
+    rtl_inputs, rtl_labels = collect_balanced_rtl_batch(test_dataset, rtl_count)
     state = model.state_dict()
 
     tensor_name = "mnist_mlp.npz"
@@ -142,9 +161,10 @@ def export_package(model, train_loader, test_loader, test_dataset, outdir,
 
     model_json = {
         "format": MODEL_FORMAT,
-        "name": "mnist_mlp_784_256_128_10",
+        "name": "mnist_mlp_784_512_256_10",
         "input_features": 784,
         "tensor_file": tensor_name,
+        "source_checkpoint": CHECKPOINT_NAME,
         "preprocess": {
             "layout": "NCHW_flattened",
             "mean": MNIST_MEAN,
@@ -155,7 +175,7 @@ def export_package(model, train_loader, test_loader, test_dataset, outdir,
                 "name": "fc1",
                 "type": "linear",
                 "in_features": 784,
-                "out_features": 256,
+                "out_features": 512,
                 "weight": "fc1.weight",
                 "bias": "fc1.bias",
                 "activation": "relu",
@@ -163,8 +183,8 @@ def export_package(model, train_loader, test_loader, test_dataset, outdir,
             {
                 "name": "fc2",
                 "type": "linear",
-                "in_features": 256,
-                "out_features": 128,
+                "in_features": 512,
+                "out_features": 256,
                 "weight": "fc2.weight",
                 "bias": "fc2.bias",
                 "activation": "relu",
@@ -172,7 +192,7 @@ def export_package(model, train_loader, test_loader, test_dataset, outdir,
             {
                 "name": "fc3",
                 "type": "linear",
-                "in_features": 128,
+                "in_features": 256,
                 "out_features": 10,
                 "weight": "fc3.weight",
                 "bias": "fc3.bias",
@@ -188,27 +208,20 @@ def export_package(model, train_loader, test_loader, test_dataset, outdir,
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Train and export the MNIST MLP")
+    parser = argparse.ArgumentParser(
+        description="Export the trained project MNIST MLP for TPU inference"
+    )
+    parser.add_argument("--checkpoint", default=None)
     parser.add_argument("--outdir", default=os.path.join("model", "artifacts", "mnist"))
     parser.add_argument("--data-dir", default=os.path.join("model", "data"))
-    parser.add_argument("--checkpoint", default=None)
-    parser.add_argument("--epochs", type=int, default=5)
     parser.add_argument("--batch-size", type=int, default=128)
-    parser.add_argument("--learning-rate", type=float, default=1e-3)
     parser.add_argument("--calibration-count", type=int, default=512)
     parser.add_argument("--rtl-count", type=int, default=32)
-    parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--download", action="store_true")
     parser.add_argument("--cpu", action="store_true")
     args = parser.parse_args()
 
     torch, nn, torchvision, transforms = require_torch()
-    random.seed(args.seed)
-    np.random.seed(args.seed)
-    torch.manual_seed(args.seed)
-    if torch.cuda.is_available():
-        torch.cuda.manual_seed_all(args.seed)
-
     transform = transforms.Compose([
         transforms.ToTensor(),
         transforms.Normalize((MNIST_MEAN,), (MNIST_STD,)),
@@ -219,9 +232,6 @@ def main():
     test_dataset = torchvision.datasets.MNIST(
         args.data_dir, train=False, download=args.download, transform=transform
     )
-    train_loader = torch.utils.data.DataLoader(
-        train_dataset, batch_size=args.batch_size, shuffle=True
-    )
     calibration_loader = torch.utils.data.DataLoader(
         train_dataset, batch_size=args.batch_size, shuffle=False
     )
@@ -231,26 +241,17 @@ def main():
     device = torch.device(
         "cpu" if args.cpu or not torch.cuda.is_available() else "cuda"
     )
+    checkpoint = find_checkpoint(args.checkpoint)
     model = build_model(nn).to(device)
-
-    if args.checkpoint:
-        state = torch.load(args.checkpoint, map_location=device)
-        model.load_state_dict(state)
-        print("loaded checkpoint: %s" % args.checkpoint)
-    else:
-        train(model, train_loader, device, args.epochs,
-              args.learning_rate, torch, nn)
+    load_checkpoint(model, checkpoint, device, torch)
 
     accuracy = evaluate(model, test_loader, device, torch)
-    checkpoint_path = os.path.join(args.outdir, "mnist_mlp.pth")
-    os.makedirs(args.outdir, exist_ok=True)
-    torch.save(model.state_dict(), checkpoint_path)
     json_path = export_package(
         model, calibration_loader, test_loader, test_dataset, args.outdir,
-        args.calibration_count, args.rtl_count, torch,
+        args.calibration_count, args.rtl_count,
     )
+    print("checkpoint: %s" % checkpoint)
     print("FP32 test accuracy: %.2f%%" % (accuracy * 100.0))
-    print("checkpoint: %s" % checkpoint_path)
     print("compiler model: %s" % json_path)
 
 

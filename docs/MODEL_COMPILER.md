@@ -5,7 +5,7 @@
 The first model workload executes the complete MNIST MLP on the TPU:
 
 ```text
-784 -> Linear 256 -> ReLU -> Linear 128 -> ReLU -> Linear 10
+784 -> Linear 512 -> ReLU -> Linear 256 -> ReLU -> Linear 10
 ```
 
 The first layer input is loaded from the Host. Intermediate payloads remain in
@@ -17,9 +17,9 @@ reporting remain in software.
 
 ```text
 src/00_TESTBED/model/
-|-- mnist_mlp.py       # PyTorch training and portable model export
+|-- mnist_mlp.py       # Existing checkpoint inference and portable export
 |-- tpu_compiler.py    # Quantization, tiling, scheduling and bundle replay
-`-- check_compiler.py  # Deterministic 784-256-128-10 self-check
+`-- check_compiler.py  # Deterministic 784-512-256-10 self-check
 ```
 
 The exported package contains:
@@ -27,30 +27,32 @@ The exported package contains:
 ```text
 model/artifacts/mnist/
 |-- mnist_mlp.json     # Graph, shapes and tensor names
-|-- mnist_mlp.npz      # Weights, bias, calibration and MNIST samples
-`-- mnist_mlp.pth      # Optional PyTorch checkpoint
+`-- mnist_mlp.npz      # Weights, bias, calibration and MNIST samples
 ```
 
 Training artifacts are not committed to Git.
 
-## Model Export
+## Checkpoint Export
 
-Run this step on a machine with PyTorch, torchvision and MNIST access. Run from
-`src/00_TESTBED`:
+The project checkpoint is produced by `model/MLP/train.py` and is named
+`mnist_mlp_model.pth`. The compiler flow never retrains it. Run the exporter on
+a machine with PyTorch, torchvision, the checkpoint and MNIST access.
+
+Run from `src/00_TESTBED`:
 
 ```sh
 python3 model/mnist_mlp.py \
     --download \
-    --epochs 5 \
+    --checkpoint ../../model/MLP/mnist_mlp_model.pth \
     --outdir model/artifacts/mnist
 ```
 
-To export an existing checkpoint without retraining:
+When the checkpoint is already under `model/MLP/`, `--checkpoint` can be
+omitted:
 
 ```sh
 python3 model/mnist_mlp.py \
     --download \
-    --checkpoint model/artifacts/mnist/mnist_mlp.pth \
     --outdir model/artifacts/mnist
 ```
 
@@ -78,12 +80,13 @@ The MNIST dimensions map to the hardware as follows:
 
 | Layer | GEMM | Tiles MT x KT x NT | WMEM slots |
 |---|---|---:|---:|
-| fc1 | 32 x 784 x 256 | 1 x 25 x 8 | 200 |
-| fc2 | 32 x 256 x 128 | 1 x 8 x 4 | 32 |
-| fc3 | 32 x 128 x 10 | 1 x 4 x 1 | 4 |
+| fc1 | 32 x 784 x 512 | 1 x 25 x 16 | 250 maximum |
+| fc2 | 32 x 512 x 256 | 1 x 16 x 8 | 128 |
+| fc3 | 32 x 256 x 10 | 1 x 8 x 1 | 8 |
 
-The first layer exercises `K_VALID=16`. The final layer exercises the N tail
-and uses `ACT_NONE`.
+The first layer has 400 weight tiles, so it is split into two N blocks using
+250 and 150 WMEM slots. It also exercises `K_VALID=16`. The final layer
+exercises the N tail and uses `ACT_NONE`.
 
 ## Accuracy
 
