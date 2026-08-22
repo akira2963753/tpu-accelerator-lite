@@ -38,7 +38,7 @@ module PATTERN (
     //=============================================================
     // ----------------------- Test Suite -------------------------
     //=============================================================
-    `include "test_suite.svh"
+    `include "pattern/test_suite.svh"
 
     //=============================================================
     // ---------------------- Pattern Data ------------------------
@@ -54,8 +54,10 @@ module PATTERN (
     int                     a_ptr;
     int                     r_ptr;
     int                     err_this;
+    int                     tests_run;
     int                     tests_pass;
     int                     tests_fail;
+    int                     selected_test;
     longint                 cyc;
     longint                 cyc_mark;
 
@@ -95,18 +97,36 @@ module PATTERN (
         input int                    index
     );
         logic [`CMD_OP_W-1:0] opcode;
+        logic [`K_VALID_W-1:0] k_valid;
+        logic [`ACT_MODE_W-1:0] act_mode;
         begin
-            opcode = desc[`CMD_OP_LSB +: `CMD_OP_W];
+            opcode   = desc[`CMD_OP_LSB +: `CMD_OP_W];
+            k_valid  = desc[`CMD_K_VALID_LSB +: `K_VALID_W];
+            act_mode = desc[`CMD_ACT_MODE_LSB +: `ACT_MODE_W];
 
             if ($isunknown(desc))
                 $fatal(1, "[ERROR] : t%02d cmd%0d contains X/Z", cur_test, index);
             if (desc[7:5] != 0 || desc[`CMD_DESC_W-1:`CMD_DEFINED_W] != 0)
                 $fatal(1, "[ERROR] : t%02d cmd%0d sets reserved bits", cur_test, index);
-            if (opcode > `CMD_OP_READ_UB)
+            if (opcode > `CMD_OP_LOAD_BIAS)
                 $fatal(1, "[ERROR] : t%02d cmd%0d has invalid opcode", cur_test, index);
             if (opcode != `CMD_OP_GEMM &&
                (desc[`CMD_ACC_INIT_BIT] || desc[`CMD_ACC_FINAL_BIT]))
                 $fatal(1, "[ERROR] : t%02d cmd%0d has invalid ACC flags", cur_test, index);
+            if (opcode == `CMD_OP_GEMM &&
+               (k_valid == 0 || k_valid > `ARRAY_S))
+                $fatal(1, "[ERROR] : t%02d cmd%0d has invalid K_VALID", cur_test, index);
+            if (opcode != `CMD_OP_GEMM && k_valid != 0)
+                $fatal(1, "[ERROR] : t%02d cmd%0d sets K_VALID", cur_test, index);
+            if (desc[`CMD_BIAS_EN_BIT] &&
+               (opcode != `CMD_OP_GEMM || !desc[`CMD_ACC_INIT_BIT]))
+                $fatal(1, "[ERROR] : t%02d cmd%0d has invalid BIAS_EN", cur_test, index);
+            if (opcode == `CMD_OP_STORE_C && act_mode > `ACT_RELU)
+                $fatal(1, "[ERROR] : t%02d cmd%0d has invalid ACT_MODE", cur_test, index);
+            if (opcode != `CMD_OP_STORE_C && act_mode != `ACT_NONE)
+                $fatal(1, "[ERROR] : t%02d cmd%0d sets ACT_MODE", cur_test, index);
+            if (opcode != `CMD_OP_LOAD_A && desc[`CMD_A_MASK_EN_BIT])
+                $fatal(1, "[ERROR] : t%02d cmd%0d sets A_MASK_EN", cur_test, index);
         end
     endtask
 
@@ -197,13 +217,25 @@ module PATTERN (
     //=============================================================
     // ----------------------- Stream Tasks -----------------------
     //=============================================================
-    task automatic feed_weight_tile();
+    task automatic feed_weight_stream(
+        input int beat_count
+    );
+        int gap_cycles;
         begin
-            for (int row = 0; row < `ARRAY_S; row++) begin
+            for (int row = 0; row < beat_count; row++) begin
                 if (w_ptr >= TEST_W_ROWS[cur_test])
                     $fatal(1, "[ERROR] : t%02d weight stream overflow", cur_test);
-                w_valid = 1;
+
+                case (TEST_WSTALL[cur_test])
+                    1       : gap_cycles = (row % 4 == 1) ? 1 : 0;
+                    2       : gap_cycles = (row % 5 == 2) ? 3 : 0;
+                    default : gap_cycles = 0;
+                endcase
+
+                w_valid = 0;
                 w_data  = mem_w[w_ptr];
+                repeat (gap_cycles) @(negedge clk);
+                w_valid = 1;
                 while (!w_ready) @(negedge clk);
                 @(negedge clk);
                 w_ptr++;
@@ -213,13 +245,25 @@ module PATTERN (
         end
     endtask
 
-    task automatic feed_activation_tile();
+    task automatic feed_activation_stream(
+        input int beat_count
+    );
+        int gap_cycles;
         begin
-            for (int row = 0; row < `ARRAY_S; row++) begin
+            for (int row = 0; row < beat_count; row++) begin
                 if (a_ptr >= TEST_A_ROWS[cur_test])
                     $fatal(1, "[ERROR] : t%02d activation stream overflow", cur_test);
-                a_valid = 1;
+
+                case (TEST_ASTALL[cur_test])
+                    1       : gap_cycles = (row % 4 == 1) ? 1 : 0;
+                    2       : gap_cycles = (row % 5 == 2) ? 3 : 0;
+                    default : gap_cycles = 0;
+                endcase
+
+                a_valid = 0;
                 a_data  = mem_a[a_ptr];
+                repeat (gap_cycles) @(negedge clk);
+                a_valid = 1;
                 while (!a_ready) @(negedge clk);
                 @(negedge clk);
                 a_ptr++;
@@ -230,30 +274,49 @@ module PATTERN (
     endtask
 
     task automatic monitor_result_tile();
-        int beat;
-        int phase;
+        int                     beat;
+        int                     phase;
+        logic             hold_active;
+        logic [`R_BW-1:0] hold_data;
         begin
-            beat  = 0;
-            phase = 0;
+            beat        = 0;
+            phase       = 0;
+            hold_active = 0;
+            hold_data   = '0;
             while (beat < `ARRAY_S) begin
-                if (TEST_RSTALL[cur_test] && phase % 5 == 2)
-                    r_ready = 0;
-                else
-                    r_ready = 1;
+                case (TEST_RSTALL[cur_test])
+                    1       : r_ready = (phase % 5 != 2);
+                    2       : r_ready = !((phase % 9 >= 2) && (phase % 9 <= 5));
+                    default : r_ready = 1;
+                endcase
 
                 if ($isunknown(r_valid))
                     $fatal(1, "[ERROR] : t%02d r_valid is X/Z", cur_test);
+                if (r_valid && $isunknown(r_data))
+                    $fatal(1, "[ERROR] : t%02d result beat contains X/Z", cur_test);
+
+                if (hold_active) begin
+                    if (!r_valid)
+                        $fatal(1, "[ERROR] : t%02d r_valid dropped during stall", cur_test);
+                    if (r_data !== hold_data)
+                        $fatal(1, "[ERROR] : t%02d r_data changed during stall", cur_test);
+                end
+
+                if (r_valid && !r_ready && !hold_active) begin
+                    hold_active = 1;
+                    hold_data   = r_data;
+                end
+
                 if (r_valid && r_ready) begin
                     if (r_ptr >= TEST_R_ROWS[cur_test])
                         $fatal(1, "[ERROR] : t%02d result stream overflow", cur_test);
-                    if ($isunknown(r_data))
-                        $fatal(1, "[ERROR] : t%02d result beat contains X/Z", cur_test);
                     if (r_data !== mem_g[r_ptr]) begin
                         if (err_this < 8)
                             $display("  [MISMATCH] t%02d beat=%0d exp=%064h got=%064h",
                                      cur_test, r_ptr, mem_g[r_ptr], r_data);
                         err_this++;
                     end
+                    hold_active = 0;
                     beat++;
                     r_ptr++;
                 end
@@ -280,10 +343,16 @@ module PATTERN (
 
                 case (opcode)
                     `CMD_OP_LOAD_W: begin
-                        feed_weight_tile();
+                        feed_weight_stream(`ARRAY_S);
+                    end
+                    `CMD_OP_LOAD_BIAS: begin
+                        feed_weight_stream(`BIAS_BEATS);
                     end
                     `CMD_OP_LOAD_A: begin
-                        feed_activation_tile();
+                        feed_activation_stream(
+                            `ARRAY_S +
+                            (desc[`CMD_A_MASK_EN_BIT] ? `AMASK_BEATS : 0)
+                        );
                     end
                     `CMD_OP_STORE_C,
                     `CMD_OP_READ_UB: begin
@@ -319,11 +388,11 @@ module PATTERN (
         begin
             if (err_this == 0) begin
                 tests_pass++;
-                $display("  [PASS] t%02d %-18s cyc=%0d",
+                $display("  [PASS] t%02d %-22s cyc=%0d",
                          cur_test, TEST_NAME[cur_test], cyc - cyc_mark);
             end else begin
                 tests_fail++;
-                $display("  [FAIL] t%02d %-18s err=%0d cyc=%0d",
+                $display("  [FAIL] t%02d %-22s err=%0d cyc=%0d",
                          cur_test, TEST_NAME[cur_test], err_this, cyc - cyc_mark);
             end
         end
@@ -333,9 +402,9 @@ module PATTERN (
         begin
             $display("============================================");
             if (tests_fail == 0)
-                $display("  [SUCCESS] ALL %0d / %0d TESTS PASS !", tests_pass, NUM_TESTS);
+                $display("  [SUCCESS] ALL %0d / %0d TESTS PASS !", tests_pass, tests_run);
             else
-                $display("  [FAILURE] %0d / %0d TESTS FAILED", tests_fail, NUM_TESTS);
+                $display("  [FAILURE] %0d / %0d TESTS FAILED", tests_fail, tests_run);
             $display("  total cycles : %0d", cyc);
             $display("============================================");
         end
@@ -353,28 +422,38 @@ module PATTERN (
     // ------------------------- Main Flow ------------------------
     //=============================================================
     initial begin
-        cyc        = 0;
-        cyc_mark   = 0;
-        cur_test   = 0;
-        tests_pass = 0;
-        tests_fail = 0;
+        cyc           = 0;
+        cyc_mark      = 0;
+        cur_test      = 0;
+        tests_run     = 0;
+        tests_pass    = 0;
+        tests_fail    = 0;
+        selected_test = -1;
+
+        if ($value$plusargs("TEST_ID=%d", selected_test)) begin
+            if (selected_test < 0 || selected_test >= NUM_TESTS)
+                $fatal(1, "[ERROR] : TEST_ID %0d is out of range", selected_test);
+        end
 
         for (int test_index = 0; test_index < NUM_TESTS; test_index++) begin
-            cur_test = test_index;
-            reset_dut();
-            load_case_files(test_index);
-            cmd_ptr   = 0;
-            w_ptr     = 0;
-            a_ptr     = 0;
-            r_ptr     = 0;
-            err_this  = 0;
-            cyc_mark  = cyc;
+            if (selected_test < 0 || selected_test == test_index) begin
+                cur_test = test_index;
+                tests_run++;
+                reset_dut();
+                load_case_files(test_index);
+                cmd_ptr   = 0;
+                w_ptr     = 0;
+                a_ptr     = 0;
+                r_ptr     = 0;
+                err_this  = 0;
+                cyc_mark  = cyc;
 
-            $display("  [RUN] t%02d %-18s M=%0d K=%0d N=%0d",
-                     test_index, TEST_NAME[test_index],
-                     TEST_M[test_index], TEST_K[test_index], TEST_N[test_index]);
-            replay_trace();
-            judge();
+                $display("  [RUN] t%02d %-22s M=%0d K=%0d N=%0d",
+                         test_index, TEST_NAME[test_index],
+                         TEST_M[test_index], TEST_K[test_index], TEST_N[test_index]);
+                replay_trace();
+                judge();
+            end
         end
 
         end_task();

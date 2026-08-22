@@ -38,15 +38,27 @@ module TSC (
     output logic weight_valid,
     output logic skew_en,
     output logic activation_valid,
+    output logic [`ROW_IDX_W-1:0] activation_row_idx,
+
+    output logic amask_init,
+    output logic amask_default_valid,
+    output logic amask_wr_en,
+    output logic [`AMASK_BEAT_W-1:0] amask_wr_beat,
+
+    output logic bias_wr_en,
+    output logic [`BIAS_BEAT_W-1:0] bias_wr_beat,
 
     output logic acc_clr,
+    output logic acc_bias_en,
     output logic [`ARRAY_S-1:0] acc_wr_en,
     output logic [`ARRAY_S*`ROW_IDX_W-1:0] acc_wr_row,
     output logic acc_rd_en,
     output logic [`ROW_IDX_W-1:0] acc_rd_row,
 
+    output logic [`K_VALID_W-1:0] k_valid_q,
     output logic [`QMULT_W-1:0] quant_mult_q,
-    output logic [`QSHIFT_W-1:0] quant_shift_q
+    output logic [`QSHIFT_W-1:0] quant_shift_q,
+    output logic [`ACT_MODE_W-1:0] act_mode_q
 );
 
     localparam ACT_N       = `ARRAY_S;
@@ -56,11 +68,12 @@ module TSC (
     localparam TILE_CNT_W  = $clog2(`ARRAY_S + 1);
     localparam GEMM_CNT_W  = $clog2(CAL_TOTAL);
 
-    typedef enum logic [2:0] {
+    typedef enum logic [3:0] {
         IDLE,
         LOAD_W,
         PRELOAD_W,
         LOAD_A,
+        LOAD_BIAS,
         GEMM,
         STORE_C,
         READ_UB,
@@ -71,8 +84,12 @@ module TSC (
 
     wire [`CMD_OP_W-1:0] cmd_op;
     wire cmd_acc_init;
+    wire cmd_bias_en;
+    wire cmd_a_mask_en;
+    wire [`K_VALID_W-1:0] cmd_k_valid;
     wire [`QMULT_W-1:0] cmd_quant_mult;
     wire [`QSHIFT_W-1:0] cmd_quant_shift;
+    wire [`ACT_MODE_W-1:0] cmd_act_mode;
     wire [`WMEM_SLOT_W-1:0] cmd_w_slot;
     wire [`UB_SLOT_W-1:0] cmd_src_slot;
     wire [`UB_SLOT_W-1:0] cmd_dst_slot;
@@ -80,20 +97,27 @@ module TSC (
 
     assign cmd_op = cmd_desc[`CMD_OP_LSB +: `CMD_OP_W];
     assign cmd_acc_init = cmd_desc[`CMD_ACC_INIT_BIT];
+    assign cmd_bias_en = cmd_desc[`CMD_BIAS_EN_BIT];
+    assign cmd_a_mask_en = cmd_desc[`CMD_A_MASK_EN_BIT];
+    assign cmd_k_valid = cmd_desc[`CMD_K_VALID_LSB +: `K_VALID_W];
     assign cmd_quant_mult = cmd_desc[`CMD_QMULT_LSB +: `QMULT_W];
     assign cmd_quant_shift = cmd_desc[`CMD_QSHIFT_LSB +: `QSHIFT_W];
+    assign cmd_act_mode = cmd_desc[`CMD_ACT_MODE_LSB +: `ACT_MODE_W];
     assign cmd_w_slot = cmd_desc[`CMD_W_SLOT_LSB +: `WMEM_SLOT_W];
     assign cmd_src_slot = cmd_desc[`CMD_SRC_SLOT_LSB +: `UB_SLOT_W];
     assign cmd_dst_slot = cmd_desc[`CMD_DST_SLOT_LSB +: `UB_SLOT_W];
     assign cmd_accept = (state == IDLE) && cmd_valid;
 
     logic acc_init_q;
+    logic bias_en_q;
+    logic a_mask_en_q;
     logic [`WMEM_SLOT_W-1:0] w_slot_q;
     logic [`UB_SLOT_W-1:0] src_slot_q;
     logic [`UB_SLOT_W-1:0] dst_slot_q;
 
     logic [TILE_CNT_W-1:0] a_cnt;
     logic [TILE_CNT_W-1:0] w_cnt;
+    logic [`BIAS_BEAT_W:0] bias_cnt;
     logic [TILE_CNT_W-1:0] pw;
     logic [GEMM_CNT_W-1:0] cc;
     logic [TILE_CNT_W-1:0] ov;
@@ -102,10 +126,15 @@ module TSC (
 
     wire a_beat;
     wire w_beat;
+    wire bias_beat;
     wire ru_issue;
+    wire [TILE_CNT_W-1:0] a_limit;
 
-    assign a_beat = (state == LOAD_A) && a_valid && (a_cnt != `ARRAY_S);
+    assign a_limit = a_mask_en_q ? (`ARRAY_S + `AMASK_BEATS) : `ARRAY_S;
+    assign a_beat = (state == LOAD_A) && a_valid && (a_cnt != a_limit);
     assign w_beat = (state == LOAD_W) && w_valid && (w_cnt != `ARRAY_S);
+    assign bias_beat = (state == LOAD_BIAS) && w_valid &&
+                       (bias_cnt != `BIAS_BEATS);
     assign ru_issue = (state == READ_UB) &&
                       (ru_cnt < `ARRAY_S) &&
                       (!ru_valid_q || r_ready);
@@ -130,6 +159,7 @@ module TSC (
                         `CMD_OP_LOAD_W    : nx_state = LOAD_W;
                         `CMD_OP_PRELOAD_W : nx_state = PRELOAD_W;
                         `CMD_OP_LOAD_A    : nx_state = LOAD_A;
+                        `CMD_OP_LOAD_BIAS : nx_state = LOAD_BIAS;
                         `CMD_OP_GEMM      : nx_state = GEMM;
                         `CMD_OP_STORE_C   : nx_state = STORE_C;
                         `CMD_OP_READ_UB   : nx_state = READ_UB;
@@ -149,8 +179,12 @@ module TSC (
                 else               nx_state = PRELOAD_W;
             end
             LOAD_A: begin
-                if(a_cnt == `ARRAY_S) nx_state = DONE;
-                else                  nx_state = LOAD_A;
+                if(a_cnt == a_limit) nx_state = DONE;
+                else                 nx_state = LOAD_A;
+            end
+            LOAD_BIAS: begin
+                if(bias_cnt == `BIAS_BEATS) nx_state = DONE;
+                else                         nx_state = LOAD_BIAS;
             end
             GEMM: begin
                 if(cc == CAL_TOTAL-1) nx_state = DONE;
@@ -177,13 +211,18 @@ module TSC (
     always_ff @(posedge clk or negedge rst_n) begin
         if(!rst_n) begin
             acc_init_q <= 0;
+            bias_en_q <= 0;
+            a_mask_en_q <= 0;
             w_slot_q <= 0;
             src_slot_q <= 0;
             dst_slot_q <= 0;
             quant_mult_q <= 0;
             quant_shift_q <= 0;
+            k_valid_q <= 0;
+            act_mode_q <= `ACT_NONE;
             a_cnt <= 0;
             w_cnt <= 0;
+            bias_cnt <= 0;
             pw <= 0;
             cc <= 0;
             ov <= 0;
@@ -194,11 +233,15 @@ module TSC (
         else begin
             if(cmd_accept) begin
                 acc_init_q <= cmd_acc_init;
+                bias_en_q <= cmd_bias_en;
+                a_mask_en_q <= cmd_a_mask_en;
                 w_slot_q <= cmd_w_slot;
                 src_slot_q <= cmd_src_slot;
                 dst_slot_q <= cmd_dst_slot;
                 quant_mult_q <= cmd_quant_mult;
                 quant_shift_q <= cmd_quant_shift;
+                k_valid_q <= cmd_k_valid;
+                act_mode_q <= cmd_act_mode;
             end
 
             if(state == LOAD_W) begin
@@ -213,6 +256,13 @@ module TSC (
             end
             else begin
                 a_cnt <= 0;
+            end
+
+            if(state == LOAD_BIAS) begin
+                if(bias_beat) bias_cnt <= bias_cnt + 1'b1;
+            end
+            else begin
+                bias_cnt <= 0;
             end
 
             if(state == PRELOAD_W) begin
@@ -278,10 +328,22 @@ module TSC (
         busy = (state != IDLE);
         done = (state == DONE);
 
-        w_ready = (state == LOAD_W) && (w_cnt != `ARRAY_S);
-        a_ready = (state == LOAD_A) && (a_cnt != `ARRAY_S);
+        w_ready = ((state == LOAD_W) && (w_cnt != `ARRAY_S)) ||
+                  ((state == LOAD_BIAS) && (bias_cnt != `BIAS_BEATS));
+        a_ready = (state == LOAD_A) && (a_cnt != a_limit);
         r_valid = (state == STORE_C) || ((state == READ_UB) && ru_valid_q);
         r_from_ub = (state == READ_UB);
+
+        amask_init = cmd_accept && (cmd_op == `CMD_OP_LOAD_A);
+        amask_default_valid = !cmd_a_mask_en;
+        amask_wr_en = (state == LOAD_A) && a_beat &&
+                      (a_cnt >= `ARRAY_S);
+        amask_wr_beat = 0;
+        if(a_cnt >= `ARRAY_S)
+            amask_wr_beat = a_cnt - `ARRAY_S;
+
+        bias_wr_en = bias_beat;
+        bias_wr_beat = bias_cnt[`BIAS_BEAT_W-1:0];
 
         wpu_wmem_w = w_beat;
         wmem_addr = 0;
@@ -301,7 +363,7 @@ module TSC (
         ub_en = 0;
         ub_we = 0;
 
-        if(state == LOAD_A && a_beat) begin
+        if(state == LOAD_A && a_beat && a_cnt < `ARRAY_S) begin
             ub_addr = {src_slot_q, a_cnt[`ROW_IDX_W-1:0]};
             ub_en = 1'b1;
             ub_we = 1'b1;
@@ -323,8 +385,10 @@ module TSC (
         weight_valid = (state == PRELOAD_W) && (pw > 0) && (pw <= `ARRAY_S);
         skew_en = (state == GEMM) && (cc >= 1);
         activation_valid = (state == GEMM) && (cc >= 1) && (cc <= ACT_N);
+        activation_row_idx = activation_valid ? cc - 1'b1 : 0;
 
         acc_clr = (state == GEMM) && acc_init_q && (cc == 0);
+        acc_bias_en = acc_init_q && bias_en_q;
 
         for(int j = 0; j < `ARRAY_S; j++) begin
             acc_wr_en[j] = en_chain[j];

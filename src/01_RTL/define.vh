@@ -62,8 +62,23 @@
 
     `define ACC_W (`PSUM_W + $clog2(`K_MAX / `ARRAY_S))
 
+    `define BIAS_W          `ACC_W
+    `define BIAS_CONTAINER_W 32
+    `define BIAS_PER_BEAT   (`W_RAW_BW / `BIAS_CONTAINER_W)
+    `define BIAS_BEATS      (`ARRAY_S / `BIAS_PER_BEAT)
+    `define BIAS_BEAT_W     $clog2(`BIAS_BEATS)
+
+    `define AMASK_BW        (`ARRAY_S * `ARRAY_S)
+    `define AMASK_BEATS     (`AMASK_BW / `A_BW)
+    `define AMASK_BEAT_W    $clog2(`AMASK_BEATS)
+
     `define QMULT_W  18
     `define QSHIFT_W 6
+    `define K_VALID_W $clog2(`ARRAY_S + 1)
+    `define ACT_MODE_W 2
+
+    `define ACT_NONE 2'd0
+    `define ACT_RELU 2'd1
 
     `define CMD_DESC_W 512
     `define CMD_OP_W   3
@@ -75,6 +90,7 @@
     `define CMD_OP_GEMM      3'd4
     `define CMD_OP_STORE_C   3'd5
     `define CMD_OP_READ_UB   3'd6
+    `define CMD_OP_LOAD_BIAS 3'd7
 
     `define CMD_OP_LSB        0
     `define CMD_ACC_INIT_BIT  (`CMD_OP_LSB + `CMD_OP_W)
@@ -91,6 +107,10 @@
     `define CMD_W_SLOT_LSB    (`CMD_NT_LSB + `CMD_NT_W)
     `define CMD_SRC_SLOT_LSB  (`CMD_W_SLOT_LSB + `WMEM_SLOT_W)
     `define CMD_DST_SLOT_LSB  (`CMD_SRC_SLOT_LSB + `UB_SLOT_W)
-    `define CMD_DEFINED_W     (`CMD_DST_SLOT_LSB + `UB_SLOT_W)
+    `define CMD_K_VALID_LSB   (`CMD_DST_SLOT_LSB + `UB_SLOT_W)
+    `define CMD_BIAS_EN_BIT   (`CMD_K_VALID_LSB + `K_VALID_W)
+    `define CMD_ACT_MODE_LSB  (`CMD_BIAS_EN_BIT + 1)
+    `define CMD_A_MASK_EN_BIT (`CMD_ACT_MODE_LSB + `ACT_MODE_W)
+    `define CMD_DEFINED_W     (`CMD_A_MASK_EN_BIT + 1)
 
 `endif

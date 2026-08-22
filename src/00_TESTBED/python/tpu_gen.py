@@ -18,6 +18,12 @@ ACC_W = 29
 QMULT_W = 18
 QSHIFT_W = 6
 SAT_MAX = (1 << (A_W - 1)) - 1
+SAT_MIN = -(1 << (A_W - 1))
+BIAS_W = ACC_W
+BIAS_CONTAINER_W = 32
+BIAS_PER_BEAT = 8
+BIAS_BEATS = 4
+AMASK_BEATS = 8
 
 
 def mask(value, width):
@@ -59,14 +65,44 @@ def rpe_contribution(activation_payload, raw_weight):
     return wrap_signed((activation_5b * weight_5b) << shift, 16)
 
 
-def op_model(acc_value, qmult, qshift):
+def op_model(acc_value, qmult, qshift, act_mode=tc.ACT_RELU):
     """Match OP.sv for one lane and return a 4-bit UB payload."""
     acc_value = wrap_signed(acc_value, ACC_W)
     qmult = wrap_signed(qmult, QMULT_W)
-    relu = 0 if acc_value < 0 else acc_value
-    product = wrap_signed(relu * qmult, ACC_W + QMULT_W)
+    activated = max(acc_value, 0) if act_mode == tc.ACT_RELU else acc_value
+    product = wrap_signed(activated * qmult, ACC_W + QMULT_W)
     quantized = product >> int(qshift)
-    return SAT_MAX if quantized > SAT_MAX else mask(quantized, A_W)
+    if act_mode == tc.ACT_RELU:
+        quantized = max(quantized, 0)
+    quantized = min(max(quantized, SAT_MIN), SAT_MAX)
+    return mask(quantized, A_W)
+
+
+def matmul_tile_acc_model(activation, weight, k_valid=ARRAY_S,
+                          activation_mask=None):
+    """Model one 32x32 GEMM command before ACC initialization."""
+    assert len(activation) == ARRAY_S
+    assert len(weight) == ARRAY_S
+    assert all(len(row) == ARRAY_S for row in activation)
+    assert all(len(row) == ARRAY_S for row in weight)
+    assert 1 <= k_valid <= ARRAY_S
+    if activation_mask is None:
+        activation_mask = [[1 for _ in range(ARRAY_S)] for _ in range(ARRAY_S)]
+
+    output = [[0 for _ in range(ARRAY_S)] for _ in range(ARRAY_S)]
+    for m_idx in range(ARRAY_S):
+        for n_idx in range(ARRAY_S):
+            psum = 0
+            for k_idx in range(k_valid):
+                if activation_mask[m_idx][k_idx]:
+                    psum = wrap_signed(
+                        psum + rpe_contribution(
+                            activation[m_idx][k_idx], weight[k_idx][n_idx]
+                        ),
+                        PSUM_W,
+                    )
+            output[m_idx][n_idx] = wrap_signed(psum, ACC_W)
+    return output
 
 
 def matmul_acc_model(activation, weight):
@@ -97,10 +133,10 @@ def matmul_acc_model(activation, weight):
     return output
 
 
-def matmul_model(activation, weight, qmult, qshift):
+def matmul_model(activation, weight, qmult, qshift, act_mode=tc.ACT_RELU):
     acc = matmul_acc_model(activation, weight)
     return [
-        [op_model(value, qmult, qshift) for value in row]
+        [op_model(value, qmult, qshift, act_mode) for value in row]
         for row in acc
     ]
 
@@ -177,6 +213,51 @@ def pack_activation_tile(activation, mt, kt):
     return rows
 
 
+def pack_activation_mask(activation_mask):
+    flat = [
+        int(bool(activation_mask[m_idx][k_idx]))
+        for m_idx in range(ARRAY_S)
+        for k_idx in range(ARRAY_S)
+    ]
+    return [pack_row(flat[beat*128:(beat+1)*128], 1)
+            for beat in range(AMASK_BEATS)]
+
+
+def unpack_activation_mask(rows):
+    assert len(rows) == AMASK_BEATS
+    flat = []
+    for row in rows:
+        flat.extend(unpack_row(row, 1, 128))
+    return [flat[m_idx*ARRAY_S:(m_idx+1)*ARRAY_S]
+            for m_idx in range(ARRAY_S)]
+
+
+def pack_bias(bias):
+    assert len(bias) == ARRAY_S
+    minimum = -(1 << (BIAS_W - 1))
+    maximum = (1 << (BIAS_W - 1)) - 1
+    assert all(minimum <= value <= maximum for value in bias)
+    return [
+        pack_row(
+            [mask(value, BIAS_CONTAINER_W)
+             for value in bias[beat*BIAS_PER_BEAT:(beat+1)*BIAS_PER_BEAT]],
+            BIAS_CONTAINER_W,
+        )
+        for beat in range(BIAS_BEATS)
+    ]
+
+
+def unpack_bias(rows):
+    assert len(rows) == BIAS_BEATS
+    values = []
+    for row in rows:
+        values.extend(
+            signed(value, BIAS_W)
+            for value in unpack_row(row, BIAS_CONTAINER_W, BIAS_PER_BEAT)
+        )
+    return values
+
+
 def pack_output_tile(output, mt, nt):
     rows = []
     base_m = mt * ARRAY_S
@@ -196,6 +277,111 @@ def expand_ub_rows(payload_rows):
         payload = unpack_row(payload_row, A_W)
         rows.append(pack_row([lane << (R_W - A_W) for lane in payload], R_W))
     return rows
+
+
+def unpack_tile(rows, lane_width):
+    """Convert 32 packed rows into one 32x32 tile."""
+    assert len(rows) == ARRAY_S
+    return [unpack_row(row, lane_width) for row in rows]
+
+
+def replay_commands(commands, weight_rows, activation_rows):
+    """Replay one legal serial trace and return external result rows."""
+    wmem = {}
+    ub = {}
+    active_weight = None
+    active_mask = [[1 for _ in range(ARRAY_S)] for _ in range(ARRAY_S)]
+    active_bias = [0 for _ in range(ARRAY_S)]
+    accumulator = [[0 for _ in range(ARRAY_S)] for _ in range(ARRAY_S)]
+    golden_rows = []
+    w_ptr = 0
+    a_ptr = 0
+
+    for command in commands:
+        fields = tc.decode_descriptor(command.word)
+        op = fields["opcode"]
+
+        if op == tc.CMD_OP_NOP:
+            continue
+        if op == tc.CMD_OP_LOAD_W:
+            rows = weight_rows[w_ptr:w_ptr + ARRAY_S]
+            assert len(rows) == ARRAY_S, "weight stream underflow"
+            wmem[fields["w_slot"]] = unpack_tile(rows, W_W)
+            w_ptr += ARRAY_S
+            continue
+        if op == tc.CMD_OP_PRELOAD_W:
+            assert fields["w_slot"] in wmem, "PRELOAD_W uses empty WMEM slot"
+            active_weight = wmem[fields["w_slot"]]
+            continue
+        if op == tc.CMD_OP_LOAD_BIAS:
+            rows = weight_rows[w_ptr:w_ptr + BIAS_BEATS]
+            assert len(rows) == BIAS_BEATS, "bias stream underflow"
+            active_bias = unpack_bias(rows)
+            w_ptr += BIAS_BEATS
+            continue
+        if op == tc.CMD_OP_LOAD_A:
+            rows = activation_rows[a_ptr:a_ptr + ARRAY_S]
+            assert len(rows) == ARRAY_S, "activation stream underflow"
+            ub[fields["src_slot"]] = unpack_tile(rows, A_W)
+            a_ptr += ARRAY_S
+            if fields["a_mask_en"]:
+                rows = activation_rows[a_ptr:a_ptr + AMASK_BEATS]
+                assert len(rows) == AMASK_BEATS, "activation mask underflow"
+                active_mask = unpack_activation_mask(rows)
+                a_ptr += AMASK_BEATS
+            else:
+                active_mask = [
+                    [1 for _ in range(ARRAY_S)] for _ in range(ARRAY_S)
+                ]
+            continue
+        if op == tc.CMD_OP_GEMM:
+            assert active_weight is not None, "GEMM has no active weight tile"
+            assert fields["src_slot"] in ub, "GEMM uses empty UB slot"
+            tile_acc = matmul_tile_acc_model(
+                ub[fields["src_slot"]],
+                active_weight,
+                fields["k_valid"],
+                active_mask,
+            )
+            if fields["acc_init"]:
+                accumulator = [
+                    [wrap_signed(
+                        tile_acc[row][lane] +
+                        (active_bias[lane] if fields["bias_en"] else 0),
+                        ACC_W,
+                    ) for lane in range(ARRAY_S)]
+                    for row in range(ARRAY_S)
+                ]
+            else:
+                accumulator = [
+                    [wrap_signed(accumulator[row][lane] + tile_acc[row][lane], ACC_W)
+                     for lane in range(ARRAY_S)]
+                    for row in range(ARRAY_S)
+                ]
+            continue
+        if op == tc.CMD_OP_STORE_C:
+            payload = [
+                [op_model(value, fields["qmult"], fields["qshift"],
+                          fields["act_mode"])
+                 for value in row]
+                for row in accumulator
+            ]
+            ub[fields["dst_slot"]] = payload
+            golden_rows.extend(expand_ub_rows(
+                [pack_row(row, A_W) for row in payload]
+            ))
+            continue
+        if op == tc.CMD_OP_READ_UB:
+            assert fields["src_slot"] in ub, "READ_UB uses empty UB slot"
+            golden_rows.extend(expand_ub_rows(
+                [pack_row(row, A_W) for row in ub[fields["src_slot"]]]
+            ))
+            continue
+        raise AssertionError("unsupported opcode %d" % op)
+
+    assert w_ptr == len(weight_rows), "unused weight stream rows"
+    assert a_ptr == len(activation_rows), "unused activation stream rows"
+    return golden_rows
 
 
 def write_dat(path, rows, total_bits):
@@ -250,7 +436,9 @@ def main():
             golden_rows.extend(pack_output_tile(output, command.mt, command.nt))
 
     here = os.path.dirname(os.path.abspath(__file__))
-    outdir = args.outdir or os.path.normpath(os.path.join(here, "..", "pattern"))
+    outdir = args.outdir or os.path.normpath(os.path.join(
+        here, "..", "pattern"
+    ))
     os.makedirs(outdir, exist_ok=True)
 
     write_dat(

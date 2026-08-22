@@ -38,7 +38,13 @@ module TPU (
     logic ub_en, ub_we;
     logic r_from_ub;
     logic weight_valid, skew_en, activation_valid;
+    logic [`ROW_IDX_W-1:0] activation_row_idx;
+    logic amask_init, amask_default_valid, amask_wr_en;
+    logic [`AMASK_BEAT_W-1:0] amask_wr_beat;
+    logic bias_wr_en;
+    logic [`BIAS_BEAT_W-1:0] bias_wr_beat;
     logic acc_clr;
+    logic acc_bias_en;
     logic [`ARRAY_S-1:0] acc_wr_en;
     logic [`ARRAY_S*`ROW_IDX_W-1:0] acc_wr_row;
     logic acc_rd_en;
@@ -52,23 +58,51 @@ module TPU (
     logic [`UB_DW-1:0] ub_data_o;
     logic [`A_BW-1:0] activation_row;
     logic [`A_BW-1:0] ds_activation_o;
+    logic [`AMASK_BW-1:0] active_amask;
+    logic [`ARRAY_S-1:0] activation_mask_row;
+    logic [`ARRAY_S-1:0] ds_activation_mask;
     logic [`PSUM_BW-1:0] rsa_psum;
     logic [`ARRAY_S*`ACC_W-1:0] acc_o;
     logic [`A_BW-1:0] op_data;
     logic [`R_BW-1:0] op_r_data;
     logic [`R_BW-1:0] ub_r_data;
 
-    // TFLite's Quantize Multiplier :
+    // TFLite's Quantize Multiplier:
     // Yi = (Wi * Ai) * (Sw * Sa) / Sy 
     // M = Sw * Sa / Sy encode as qmult / 2^qshift
 
     logic [`QMULT_W-1:0] qmult_q;
     logic [`QSHIFT_W-1:0] qshift_q;
+    logic [`K_VALID_W-1:0] k_valid_q;
+    logic [`ACT_MODE_W-1:0] act_mode_q;
 
     assign wmem_mem_addr = wmem_we ? wpu_wmem_addr : wmem_addr;
     assign ub_data_i = (r_valid && !r_from_ub) ? op_data : a_data;
     assign activation_row = activation_valid ? ub_data_o : 0;
     assign r_data = r_from_ub ? ub_r_data : op_r_data;
+
+    always_ff @(posedge clk or negedge rst_n) begin
+        if(!rst_n) begin
+            active_amask <= '1;
+        end
+        else if(amask_init) begin
+            active_amask <= amask_default_valid ? '1 : '0;
+        end
+        else if(amask_wr_en) begin
+            active_amask[`A_BW*amask_wr_beat +: `A_BW] <= a_data;
+        end
+    end
+
+    always_comb begin
+        activation_mask_row = 0;
+        if(activation_valid) begin
+            for(int k = 0; k < `ARRAY_S; k++) begin
+                activation_mask_row[k] =
+                    active_amask[`ARRAY_S*activation_row_idx+k] &&
+                    (k < k_valid_q);
+            end
+        end
+    end
 
     genvar i;
     generate
@@ -103,13 +137,23 @@ module TPU (
         .weight_valid(weight_valid),
         .skew_en(skew_en),
         .activation_valid(activation_valid),
+        .activation_row_idx(activation_row_idx),
+        .amask_init(amask_init),
+        .amask_default_valid(amask_default_valid),
+        .amask_wr_en(amask_wr_en),
+        .amask_wr_beat(amask_wr_beat),
+        .bias_wr_en(bias_wr_en),
+        .bias_wr_beat(bias_wr_beat),
         .acc_clr(acc_clr),
+        .acc_bias_en(acc_bias_en),
         .acc_wr_en(acc_wr_en),
         .acc_wr_row(acc_wr_row),
         .acc_rd_en(acc_rd_en),
         .acc_rd_row(acc_rd_row),
+        .k_valid_q(k_valid_q),
         .quant_mult_q(qmult_q),
-        .quant_shift_q(qshift_q));
+        .quant_shift_q(qshift_q),
+        .act_mode_q(act_mode_q));
 
     WPU u_WPU(
         .clk(clk),
@@ -140,8 +184,10 @@ module TPU (
         .clk(clk),
         .rst_n(rst_n),
         .activation_i(activation_row),
+        .valid_i(activation_mask_row),
         .skew_en(skew_en),
-        .activation_o(ds_activation_o));
+        .activation_o(ds_activation_o),
+        .valid_o(ds_activation_mask));
 
     RSA u_RSA(
         .clk(clk),
@@ -149,12 +195,17 @@ module TPU (
         .weight_valid(weight_valid),
         .weight(wmem_data_o),
         .activation(ds_activation_o),
+        .activation_mask(ds_activation_mask),
         .psum(rsa_psum));
 
     ACC u_ACC(
         .clk(clk),
         .rst_n(rst_n),
         .acc_clr(acc_clr),
+        .acc_bias_en(acc_bias_en),
+        .bias_wr_en(bias_wr_en),
+        .bias_wr_beat(bias_wr_beat),
+        .bias_data_i(w_data),
         .psum_i(rsa_psum),
         .acc_wr_en(acc_wr_en),
         .acc_wr_row(acc_wr_row),
@@ -165,6 +216,7 @@ module TPU (
     OP u_OP(
         .quant_mult(qmult_q),
         .quant_shift(qshift_q),
+        .act_mode(act_mode_q),
         .acc_i(acc_o),
         .data_o(op_data));
 
