@@ -113,8 +113,16 @@ def main():
             "scale-aware requant calibration",
             all(
                 layer["stats"]["requant"]["relative_factor_error"] < 1.0e-4
-                for layer in manifest["layers"]
+                for layer in manifest["layers"][:-1]
             ),
+        ))
+        final_requant = manifest["layers"][-1]["stats"]["requant"]
+        checks.append((
+            "label-free final rank calibration",
+            final_requant["mode"] == "rank" and
+            final_requant["rank"]["candidate_count"] > 1 and
+            0 <= final_requant["rank"]["agreement"] <=
+            final_requant["rank"]["total"],
         ))
 
         predictions = compiler.hardware_inference(

@@ -133,6 +133,12 @@ layer, it derives the hardware multiplier from
 per-layer scales, encoded multiplier and mismatch rate between ideal A5
 payloads and hardware requantized payloads.
 
+The final classifier layer uses label-free rank-aware calibration. It searches
+legal `QMULT/QSHIFT` pairs around the MSE solution and selects the pair that
+best preserves the pre-quantization logit argmax. Ties and reconstruction MSE
+are secondary criteria. Hidden layers continue to use scale-aware MSE
+calibration.
+
 ## RTL Simulation
 
 After uploading the exported JSON and NPZ package, run from `src/01_RTL`:

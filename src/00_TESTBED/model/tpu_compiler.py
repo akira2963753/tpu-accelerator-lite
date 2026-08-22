@@ -307,6 +307,61 @@ def output_payload_np(accumulator, qmult, qshift, act_mode):
     }
 
 
+def choose_rank_requant(accumulator, reference, base_factor, act_mode):
+    accumulator = np.asarray(accumulator, dtype=np.int64)
+    reference = np.asarray(reference, dtype=np.float64)
+    ideal_rank = np.argmax(accumulator, axis=1)
+    candidates = set()
+    for ratio in np.geomspace(0.125, 8.0, 257):
+        factor = base_factor * float(ratio)
+        try:
+            candidates.add(encode_requant_factor(factor))
+        except ValueError:
+            continue
+    candidates.add(encode_requant_factor(base_factor))
+
+    best = None
+    for qmult, qshift in candidates:
+        payload, output_stats = output_payload_np(
+            accumulator, qmult, qshift, act_mode
+        )
+        signed = signed_payload_np(payload)
+        quantized_rank = np.argmax(signed, axis=1)
+        agreement = int(np.count_nonzero(quantized_rank == ideal_rank))
+        maximum = np.max(signed, axis=1, keepdims=True)
+        tie_rows = int(np.count_nonzero(
+            np.count_nonzero(signed == maximum, axis=1) > 1
+        ))
+        output_scale = fit_output_scale(reference, payload)
+        reconstructed = decode_activation_np(
+            payload
+        ).astype(np.float64) * output_scale
+        mse = float(np.mean((reconstructed - reference) ** 2))
+        encoded_factor = qmult / float(1 << qshift)
+        distance = abs(math.log2(encoded_factor / base_factor))
+        score = agreement, -tie_rows, -mse, -distance
+        if best is None or score > best[0]:
+            best = (
+                score,
+                qmult,
+                qshift,
+                payload,
+                output_stats,
+                output_scale,
+                {
+                    "agreement": agreement,
+                    "total": int(accumulator.shape[0]),
+                    "tie_rows": tie_rows,
+                    "candidate_count": len(candidates),
+                    "base_factor": base_factor,
+                    "selected_factor": encoded_factor,
+                },
+            )
+    if best is None:
+        raise ValueError("rank-aware calibration has no legal requant candidate")
+    return best[1:]
+
+
 def fit_output_scale(reference, payload):
     reference = np.asarray(reference, dtype=np.float64)
     decoded = decode_activation_np(payload).astype(np.float64)
@@ -380,7 +435,7 @@ def compile_quantized_layers(model_path):
     calibration_payload = quantize_activation(calibration_float, input_scale)
     quantized_layers = []
 
-    for layer in layers:
+    for layer_index, layer in enumerate(layers):
         weight = np.asarray(tensors[layer.weight_key], dtype=np.float64)
         bias = np.asarray(tensors[layer.bias_key], dtype=np.float64) \
             if layer.bias_key else np.zeros(layer.out_features, dtype=np.float64)
@@ -409,10 +464,17 @@ def compile_quantized_layers(model_path):
 
         output_scale = choose_a5_scale(reference)
         requant_factor = accumulator_scale / (2.0 * output_scale)
-        qmult, qshift = encode_requant_factor(requant_factor)
-        output_payload, output_stats = output_payload_np(
-            accumulator, qmult, qshift, act_mode
-        )
+        rank_stats = None
+        if layer_index == len(layers) - 1:
+            (qmult, qshift, output_payload, output_stats,
+             output_scale, rank_stats) = choose_rank_requant(
+                accumulator, reference, requant_factor, act_mode
+            )
+        else:
+            qmult, qshift = encode_requant_factor(requant_factor)
+            output_payload, output_stats = output_payload_np(
+                accumulator, qmult, qshift, act_mode
+            )
         ideal_payload = quantize_activation(reference, output_scale)
         reconstructed = decode_activation_np(
             output_payload
@@ -436,6 +498,8 @@ def compile_quantized_layers(model_path):
                 "reconstruction_mse": float(np.mean(
                     (reconstructed - reference) ** 2
                 )),
+                "mode": "rank" if rank_stats else "scale",
+                "rank": rank_stats,
             },
             "accumulator_min": int(np.min(accumulator)),
             "accumulator_max": int(np.max(accumulator)),
@@ -1347,6 +1411,13 @@ def ablate_command(args):
                 (layer.ir.name, layer.input_scale, layer.output_scale,
                  layer.qmult, layer.qshift, mismatch)
             )
+            if requant["rank"]:
+                rank = requant["rank"]
+                agreement = 100.0 * rank["agreement"] / rank["total"]
+                print(
+                    "         rank=%7.4f%% ties=%-4d candidates=%d" %
+                    (agreement, rank["tie_rows"], rank["candidate_count"])
+                )
         print("=" * 78)
 
 
