@@ -20,12 +20,11 @@ module WPU (
 
     logic [`W_BW-1:0] rweight_c;
 
-    genvar i;
     generate
-        for(i = 0; i < `ARRAY_S; i++) begin : ENCODE_LANE
+        for(genvar i = 0; i < `ARRAY_S; i++) begin : ENCODE_LANE
             logic [`W_W-1:0] w;
 
-            always_comb begin
+            always_comb begin : ENCODE
                 w = weight[`W_W*i +: `W_W];
                 if((&w[7:4]) ^ (|w[7:4])) begin
                     rweight_c[`RW_W*i +: `RW_W] = {1'b1, w[7:4]};
@@ -37,7 +36,7 @@ module WPU (
         end
     endgenerate
 
-    always_ff @(posedge clk or negedge rst_n) begin
+    always_ff @(posedge clk or negedge rst_n) begin : WEIGHT_REG
         if(!rst_n) begin
             rweight <= 0;
             wmem_addr_o <= 0;

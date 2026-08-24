@@ -8,7 +8,7 @@
 *
 ******************************************************************************/
 
-module RSA(
+module RSA (
     input clk,
     input rst_n,
     input weight_valid,
@@ -24,9 +24,8 @@ module RSA(
     wire weight_valid_net [0:`ARRAY_S][0:`ARRAY_S-1];
     wire [`PSUM_W-1:0] psum_net [0:`ARRAY_S][0:`ARRAY_S-1];
 
-    genvar i, j;
     generate
-        for(i = 0; i < `ARRAY_S; i++) begin : PREPROCESS_BLOCK
+        for(genvar i = 0; i < `ARRAY_S; i++) begin : PREPROCESS_BLOCK
             assign weight_net[0][i] = weight[`RW_W*i +: `RW_W];
             assign weight_valid_net[0][i] = weight_valid;
             assign activation_net[i][0] = activation[`A_W*i +: `A_W];
@@ -37,21 +36,22 @@ module RSA(
     endgenerate
 
     generate
-        for (i = 0; i < `ARRAY_S; i = i + 1) begin : ROW_GEN
-            for (j = 0; j < `ARRAY_S ; j = j + 1) begin : COL_GEN
-                RPE Reduced_Processing_Element(
-                .clk(clk),
-                .rst_n(rst_n),
-                .weight_i(weight_net[i][j]),
-                .activation_i(activation_net[i][j]),
-                .activation_valid_i(activation_valid_net[i][j]),
-                .psum_i(psum_net[i][j]),
-                .weight_valid_i(weight_valid_net[i][j]),
-                .weight_o(weight_net[i+1][j]),
-                .weight_valid_o(weight_valid_net[i+1][j]),
-                .activation_o(activation_net[i][j+1]),
-                .activation_valid_o(activation_valid_net[i][j+1]),
-                .psum_o(psum_net[i+1][j]));
+        for(genvar i = 0; i < `ARRAY_S; i++) begin : ROW_GEN
+            for(genvar j = 0; j < `ARRAY_S; j++) begin : COL_GEN
+                RPE Reduced_Processing_Element (
+                    .clk(clk),
+                    .rst_n(rst_n),
+                    .weight_i(weight_net[i][j]),
+                    .activation_i(activation_net[i][j]),
+                    .activation_valid_i(activation_valid_net[i][j]),
+                    .psum_i(psum_net[i][j]),
+                    .weight_valid_i(weight_valid_net[i][j]),
+                    .weight_o(weight_net[i+1][j]),
+                    .weight_valid_o(weight_valid_net[i+1][j]),
+                    .activation_o(activation_net[i][j+1]),
+                    .activation_valid_o(activation_valid_net[i][j+1]),
+                    .psum_o(psum_net[i+1][j])
+                );
             end
         end
     endgenerate

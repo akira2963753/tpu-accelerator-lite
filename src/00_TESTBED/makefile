@@ -4,7 +4,7 @@
 # Run simulation from src/01_RTL.
 # Run synthesis from src/02_SYN.
 #======================================================
-.PHONY: gen_suite check_replay prepare_vectors rtl_regress model_check model_compile model_emit model_replay rtl_mnist vcs_rtl vcs_rtl_dump vcs_gate syn clean
+.PHONY: gen_suite check_replay prepare_vectors rtl_regress model_check model_compile model_emit model_replay rtl_mnist resnet_export resnet_compile resnet_emit resnet_replay resnet_evaluate rtl_resnet_block vcs_rtl vcs_rtl_dump vcs_gate syn clean
 
 #======================================================
 #              Set your desired file names
@@ -19,6 +19,10 @@ SIM_ARGS ?=
 MODEL ?= compiler/artifacts/mnist/mnist_mlp.json
 COMPILED_MODEL ?= compiler/build/compiled_model.json
 MODEL_BATCH ?= 32
+RESNET_MODEL ?= compiler/artifacts/resnet18_layer2_0/mnist_resnet18_layer2_0.json
+RESNET_COMPILED ?= compiler/build/resnet18_layer2_0/compiled_model.json
+RESNET_BATCH ?= 1
+RESNET_EXPORT_ARGS ?=
 
 #======================================================
 #                          VCS
@@ -82,6 +86,24 @@ model_replay: model_emit
 	cd ../00_TESTBED && python3 compiler/tpu_compiler.py replay pattern
 
 rtl_mnist: model_replay
+	${VCS_RTL}
+
+resnet_export:
+	cd ../00_TESTBED && python3 compiler/models/mnist_resnet18.py ${RESNET_EXPORT_ARGS}
+
+resnet_compile:
+	cd ../00_TESTBED && python3 compiler/tpu_compiler.py compile ${RESNET_MODEL} --outdir compiler/build/resnet18_layer2_0
+
+resnet_emit: resnet_compile
+	cd ../00_TESTBED && python3 compiler/tpu_compiler.py emit-test ${RESNET_COMPILED} --inputs ${RESNET_MODEL} --batch-size ${RESNET_BATCH}
+
+resnet_replay: resnet_emit
+	cd ../00_TESTBED && python3 compiler/tpu_compiler.py replay pattern
+
+resnet_evaluate:
+	cd ../00_TESTBED && python3 compiler/tpu_compiler.py evaluate ${RESNET_MODEL}
+
+rtl_resnet_block: resnet_replay
 	${VCS_RTL}
 
 vcs_rtl_dump:

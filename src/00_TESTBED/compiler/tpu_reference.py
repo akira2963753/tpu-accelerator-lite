@@ -31,6 +31,83 @@ def hardware_inference(model_path, inputs, batch_size=256):
     return np.asarray(predictions, dtype=np.int64)
 
 
+def graph_bittrue_inference(model_path, inputs, compiled=None):
+    if compiled is None:
+        model_path, model, _tensors, layers = \
+            compiler.compile_quantized_layers(model_path)
+    else:
+        model_path, model, layers = compiled
+    if not all(layer.ir.op_type == "conv2d" for layer in layers):
+        raise ValueError("graph_bittrue_inference requires a Conv2D graph")
+
+    inputs = np.asarray(inputs, dtype=np.float64)
+    root_name = model["input"]["name"]
+    states = {
+        root_name: {
+            "float": inputs,
+            "payload": None,
+            "scale": None,
+        }
+    }
+    for layer in layers:
+        source = states[layer.ir.input_tensor]
+        if source["payload"] is None or not np.isclose(
+                source["scale"] or layer.input_scale,
+                layer.input_scale,
+                rtol=1.0e-12,
+                atol=0.0):
+            input_payload = compiler.quantize_activation(
+                source["float"], layer.input_scale
+            )
+        else:
+            input_payload = source["payload"]
+        activation, valid = compiler.im2col_payload(
+            input_payload, layer.ir
+        )
+        accumulator = compiler.exact_accumulate(
+            activation,
+            layer.raw_weight,
+            layer.bias_acc,
+            layer.ir.in_features,
+            valid,
+        )
+        output, _stats = compiler.output_payload_np(
+            accumulator, layer.qmult, layer.qshift, layer.act_mode
+        )
+        output = compiler.matrix_to_nchw(
+            output, inputs.shape[0], layer.ir.output_shape
+        )
+        states[layer.ir.output_tensor] = {
+            "payload": output,
+            "scale": layer.output_scale,
+            "float": compiler.decode_activation_np(output) * layer.output_scale,
+        }
+
+    for operation in model.get("host_operations", []):
+        left = states[operation["inputs"][0]]
+        right = states[operation["inputs"][1]]
+        values = (
+            compiler.decode_activation_np(left["payload"]) * left["scale"] +
+            compiler.decode_activation_np(right["payload"]) * right["scale"]
+        )
+        if operation.get("activation", "none") == "relu":
+            values = np.maximum(values, 0.0)
+        scale = float(
+            operation.get("output_scale", compiler.choose_a5_scale(values))
+        )
+        payload = compiler.quantize_activation(values, scale)
+        states[operation["output"]] = {
+            "payload": payload,
+            "scale": scale,
+            "float": compiler.decode_activation_np(payload) * scale,
+        }
+
+    output_name = model.get("output", {}).get("name")
+    if not output_name or output_name not in states:
+        output_name = layers[-1].ir.output_tensor
+    return states[output_name], states
+
+
 def fake_weight(weight, mode):
     weight = np.asarray(weight, dtype=np.float64)
     if mode == "fp32":
@@ -345,7 +422,21 @@ def quantization_ablation(model_path, inputs, labels, batch_size=512,
 
 
 def evaluate_command(args):
-    _, _, tensors, _ = compiler.load_model(args.model)
+    _, model, tensors, layers = compiler.load_model(args.model)
+    if all(layer.op_type == "conv2d" for layer in layers):
+        if "rtl_inputs" not in tensors:
+            raise ValueError("tensor package has no rtl_inputs")
+        count = args.limit or tensors["rtl_inputs"].shape[0]
+        result, _states = graph_bittrue_inference(
+            args.model, tensors["rtl_inputs"][:count]
+        )
+        print("hardware-aware block output: %s" % (result["payload"].shape,))
+        if "rtl_reference_outputs" in tensors:
+            reference = tensors["rtl_reference_outputs"][:count]
+            difference = result["float"] - reference
+            print("FP32 reference MSE: %.8g" % np.mean(difference * difference))
+            print("maximum absolute error: %.8g" % np.max(np.abs(difference)))
+        return
     if "test_inputs" not in tensors or "test_labels" not in tensors:
         raise ValueError("tensor package has no test dataset")
     inputs = tensors["test_inputs"]

@@ -1,4 +1,4 @@
-# Experiment Log
+# Experiment Results
 
 Recorded 2026-08-22. Training is FP32 on GPU; `Int8_infer.py` evaluates weight-only INT8 fake-quant on CPU (`SCALE = 128`, Q1.7).
 

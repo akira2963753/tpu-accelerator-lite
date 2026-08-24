@@ -61,12 +61,12 @@ module TSC (
     output logic [`ACT_MODE_W-1:0] act_mode_q
 );
 
-    localparam ACT_N       = `ARRAY_S;
-    localparam RESULT_LAT  = `ARRAY_S + 1;
-    localparam CAL_DRAIN   = 2*`ARRAY_S + 4;
-    localparam CAL_TOTAL   = ACT_N + CAL_DRAIN;
-    localparam TILE_CNT_W  = $clog2(`ARRAY_S + 1);
-    localparam GEMM_CNT_W  = $clog2(CAL_TOTAL);
+    localparam ACT_N = `ARRAY_S;
+    localparam RESULT_LAT = `ARRAY_S + 1;
+    localparam CAL_DRAIN = 2*`ARRAY_S + 4;
+    localparam CAL_TOTAL = ACT_N + CAL_DRAIN;
+    localparam TILE_CNT_W = $clog2(`ARRAY_S + 1);
+    localparam GEMM_CNT_W = $clog2(CAL_TOTAL);
 
     typedef enum logic [3:0] {
         IDLE,
@@ -130,7 +130,7 @@ module TSC (
     wire ru_issue;
     wire [TILE_CNT_W-1:0] a_limit;
 
-    assign a_limit = a_mask_en_q ? (`ARRAY_S + `AMASK_BEATS) : `ARRAY_S;
+    assign a_limit = (a_mask_en_q)? (`ARRAY_S + `AMASK_BEATS) : `ARRAY_S;
     assign a_beat = (state == LOAD_A) && a_valid && (a_cnt != a_limit);
     assign w_beat = (state == LOAD_W) && w_valid && (w_cnt != `ARRAY_S);
     assign bias_beat = (state == LOAD_BIAS) && w_valid &&
@@ -151,64 +151,62 @@ module TSC (
 
     logic wmem_wr_q;
 
-    always_comb begin
+    always_comb begin : NEXT_STATE
         case(state)
             IDLE: begin
                 if(cmd_valid) begin
                     case(cmd_op)
-                        `CMD_OP_LOAD_W    : nx_state = LOAD_W;
-                        `CMD_OP_PRELOAD_W : nx_state = PRELOAD_W;
-                        `CMD_OP_LOAD_A    : nx_state = LOAD_A;
-                        `CMD_OP_LOAD_BIAS : nx_state = LOAD_BIAS;
-                        `CMD_OP_GEMM      : nx_state = GEMM;
-                        `CMD_OP_STORE_C   : nx_state = STORE_C;
-                        `CMD_OP_READ_UB   : nx_state = READ_UB;
-                        default           : nx_state = DONE;
+                        `CMD_OP_LOAD_W: nx_state = LOAD_W;
+                        `CMD_OP_PRELOAD_W: nx_state = PRELOAD_W;
+                        `CMD_OP_LOAD_A: nx_state = LOAD_A;
+                        `CMD_OP_LOAD_BIAS: nx_state = LOAD_BIAS;
+                        `CMD_OP_GEMM: nx_state = GEMM;
+                        `CMD_OP_STORE_C: nx_state = STORE_C;
+                        `CMD_OP_READ_UB: nx_state = READ_UB;
+                        default: nx_state = DONE;
                     endcase
                 end
-                else begin
-                    nx_state = IDLE;
-                end
+                else nx_state = IDLE;
             end
             LOAD_W: begin
                 if(w_cnt == `ARRAY_S) nx_state = DONE;
-                else                  nx_state = LOAD_W;
+                else nx_state = LOAD_W;
             end
             PRELOAD_W: begin
                 if(pw == `ARRAY_S) nx_state = DONE;
-                else               nx_state = PRELOAD_W;
+                else nx_state = PRELOAD_W;
             end
             LOAD_A: begin
                 if(a_cnt == a_limit) nx_state = DONE;
-                else                 nx_state = LOAD_A;
+                else nx_state = LOAD_A;
             end
             LOAD_BIAS: begin
                 if(bias_cnt == `BIAS_BEATS) nx_state = DONE;
-                else                         nx_state = LOAD_BIAS;
+                else nx_state = LOAD_BIAS;
             end
             GEMM: begin
                 if(cc == CAL_TOTAL-1) nx_state = DONE;
-                else                  nx_state = GEMM;
+                else nx_state = GEMM;
             end
             STORE_C: begin
                 if(r_ready && ov == `ARRAY_S-1) nx_state = DONE;
-                else                            nx_state = STORE_C;
+                else nx_state = STORE_C;
             end
             READ_UB: begin
                 if(ru_valid_q && r_ready && ru_cnt == `ARRAY_S) nx_state = DONE;
-                else                                            nx_state = READ_UB;
+                else nx_state = READ_UB;
             end
-            DONE    : nx_state = IDLE;
-            default : nx_state = IDLE;
+            DONE: nx_state = IDLE;
+            default: nx_state = IDLE;
         endcase
     end
 
-    always_ff @(posedge clk or negedge rst_n) begin
+    always_ff @(posedge clk or negedge rst_n) begin : STATE_REG
         if(!rst_n) state <= IDLE;
         else state <= nx_state;
     end
 
-    always_ff @(posedge clk or negedge rst_n) begin
+    always_ff @(posedge clk or negedge rst_n) begin : CONTROL_REG
         if(!rst_n) begin
             acc_init_q <= 0;
             bias_en_q <= 0;
@@ -306,7 +304,7 @@ module TSC (
         end
     end
 
-    always_ff @(posedge clk or negedge rst_n) begin
+    always_ff @(posedge clk or negedge rst_n) begin : RESULT_PIPE
         if(!rst_n) begin
             for(int j = 0; j < `ARRAY_S; j++) begin
                 en_chain[j] <= 0;
@@ -323,7 +321,7 @@ module TSC (
         end
     end
 
-    always_comb begin
+    always_comb begin : CONTROL_OUTPUT
         cmd_ready = (state == IDLE);
         busy = (state != IDLE);
         done = (state == DONE);
@@ -339,8 +337,7 @@ module TSC (
         amask_wr_en = (state == LOAD_A) && a_beat &&
                       (a_cnt >= `ARRAY_S);
         amask_wr_beat = 0;
-        if(a_cnt >= `ARRAY_S)
-            amask_wr_beat = a_cnt - `ARRAY_S;
+        if(a_cnt >= `ARRAY_S) amask_wr_beat = a_cnt - `ARRAY_S;
 
         bias_wr_en = bias_beat;
         bias_wr_beat = bias_cnt[`BIAS_BEAT_W-1:0];
@@ -385,7 +382,7 @@ module TSC (
         weight_valid = (state == PRELOAD_W) && (pw > 0) && (pw <= `ARRAY_S);
         skew_en = (state == GEMM) && (cc >= 1);
         activation_valid = (state == GEMM) && (cc >= 1) && (cc <= ACT_N);
-        activation_row_idx = activation_valid ? cc - 1'b1 : 0;
+        activation_row_idx = (activation_valid)? cc - 1'b1 : 0;
 
         acc_clr = (state == GEMM) && acc_init_q && (cc == 0);
         acc_bias_en = acc_init_q && bias_en_q;

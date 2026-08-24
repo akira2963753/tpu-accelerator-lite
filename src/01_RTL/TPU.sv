@@ -68,7 +68,7 @@ module TPU (
     logic [`R_BW-1:0] ub_r_data;
 
     // TFLite's Quantize Multiplier:
-    // Yi = (Wi * Ai) * (Sw * Sa) / Sy 
+    // Yi = (Wi * Ai) * (Sw * Sa) / Sy
     // M = Sw * Sa / Sy encode as qmult / 2^qshift
 
     logic [`QMULT_W-1:0] qmult_q;
@@ -76,24 +76,24 @@ module TPU (
     logic [`K_VALID_W-1:0] k_valid_q;
     logic [`ACT_MODE_W-1:0] act_mode_q;
 
-    assign wmem_mem_addr = wmem_we ? wpu_wmem_addr : wmem_addr;
-    assign ub_data_i = (r_valid && !r_from_ub) ? op_data : a_data;
-    assign activation_row = activation_valid ? ub_data_o : 0;
-    assign r_data = r_from_ub ? ub_r_data : op_r_data;
+    assign wmem_mem_addr = (wmem_we)? wpu_wmem_addr : wmem_addr;
+    assign ub_data_i = (r_valid && !r_from_ub)? op_data : a_data;
+    assign activation_row = (activation_valid)? ub_data_o : 0;
+    assign r_data = (r_from_ub)? ub_r_data : op_r_data;
 
-    always_ff @(posedge clk or negedge rst_n) begin
+    always_ff @(posedge clk or negedge rst_n) begin : ACTIVATION_MASK
         if(!rst_n) begin
             active_amask <= '1;
         end
         else if(amask_init) begin
-            active_amask <= amask_default_valid ? '1 : '0;
+            active_amask <= (amask_default_valid)? '1 : '0;
         end
         else if(amask_wr_en) begin
             active_amask[`A_BW*amask_wr_beat +: `A_BW] <= a_data;
         end
     end
 
-    always_comb begin
+    always_comb begin : ACTIVATION_MASK_ROW
         activation_mask_row = 0;
         if(activation_valid) begin
             for(int k = 0; k < `ARRAY_S; k++) begin
@@ -104,15 +104,14 @@ module TPU (
         end
     end
 
-    genvar i;
     generate
-        for(i = 0; i < `ARRAY_S; i++) begin : OUTPUT_FORMAT
+        for(genvar i = 0; i < `ARRAY_S; i++) begin : OUTPUT_FORMAT
             assign op_r_data[`R_W*i +: `R_W] = {op_data[`A_W*i +: `A_W], {(`R_W-`A_W){1'b0}}};
             assign ub_r_data[`R_W*i +: `R_W] = {ub_data_o[`A_W*i +: `A_W], {(`R_W-`A_W){1'b0}}};
         end
     endgenerate
 
-    TSC u_TSC(
+    TSC u_TSC (
         .clk(clk),
         .rst_n(rst_n),
         .cmd_valid(cmd_valid),
@@ -153,52 +152,58 @@ module TPU (
         .k_valid_q(k_valid_q),
         .quant_mult_q(qmult_q),
         .quant_shift_q(qshift_q),
-        .act_mode_q(act_mode_q));
+        .act_mode_q(act_mode_q)
+    );
 
-    WPU u_WPU(
+    WPU u_WPU (
         .clk(clk),
         .rst_n(rst_n),
         .weight(w_data),
         .wmem_addr_i(wmem_addr),
         .wmem_w(wpu_wmem_w),
         .rweight(wpu_rweight),
-        .wmem_addr_o(wpu_wmem_addr));
+        .wmem_addr_o(wpu_wmem_addr)
+    );
 
-    WMEM_Wrapper u_WMEM_Wrapper(
+    WMEM_Wrapper u_WMEM_Wrapper (
         .clk(clk),
         .addr(wmem_mem_addr),
         .data_i(wpu_rweight),
         .en(wmem_en),
         .we(wmem_we),
-        .data_o(wmem_data_o));
+        .data_o(wmem_data_o)
+    );
 
-    UB_Wrapper u_UB_Wrapper(
+    UB_Wrapper u_UB_Wrapper (
         .clk(clk),
         .addr(ub_addr),
         .data_i(ub_data_i),
         .en(ub_en),
         .we(ub_we),
-        .data_o(ub_data_o));
+        .data_o(ub_data_o)
+    );
 
-    Data_Setup u_Data_Setup(
+    Data_Setup u_Data_Setup (
         .clk(clk),
         .rst_n(rst_n),
         .activation_i(activation_row),
         .valid_i(activation_mask_row),
         .skew_en(skew_en),
         .activation_o(ds_activation_o),
-        .valid_o(ds_activation_mask));
+        .valid_o(ds_activation_mask)
+    );
 
-    RSA u_RSA(
+    RSA u_RSA (
         .clk(clk),
         .rst_n(rst_n),
         .weight_valid(weight_valid),
         .weight(wmem_data_o),
         .activation(ds_activation_o),
         .activation_mask(ds_activation_mask),
-        .psum(rsa_psum));
+        .psum(rsa_psum)
+    );
 
-    ACC u_ACC(
+    ACC u_ACC (
         .clk(clk),
         .rst_n(rst_n),
         .acc_clr(acc_clr),
@@ -211,13 +216,15 @@ module TPU (
         .acc_wr_row(acc_wr_row),
         .acc_rd_en(acc_rd_en),
         .acc_rd_row(acc_rd_row),
-        .acc_o(acc_o));
+        .acc_o(acc_o)
+    );
 
-    OP u_OP(
+    OP u_OP (
         .quant_mult(qmult_q),
         .quant_shift(qshift_q),
         .act_mode(act_mode_q),
         .acc_i(acc_o),
-        .data_o(op_data));
+        .data_o(op_data)
+    );
 
 endmodule

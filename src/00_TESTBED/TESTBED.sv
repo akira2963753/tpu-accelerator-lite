@@ -5,15 +5,14 @@
 * Project:      tpu-accelerator-lite
 * Module:       TESTBED (TPU top)
 * Author:       Marco <harry2963753@gmail.com>
-* Student ID:   M11407439
-* Tool:         VCS & Verdi
 *
 ******************************************************************************/
+`include "define.vh"
 
-module TESTBED();
+module TESTBED;
 
     //=============================================================
-    // ---------------- Sim Mode & SDF Annotate -------------------
+    //                   Sim Mode & SDF Annotate
     //=============================================================
     `ifdef GATE
         initial begin
@@ -31,7 +30,7 @@ module TESTBED();
     `endif
 
     //=============================================================
-    // ------------------------- FSDB Dump ------------------------
+    //                          FSDB Dump
     //=============================================================
     // Dump waves when needed.
     `ifdef DUMP
@@ -42,55 +41,55 @@ module TESTBED();
     `endif
 
     //=============================================================
-    // --------------------- Design & Pattern ---------------------
+    //                      Design & Pattern
     //=============================================================
-    logic                   clk, rst_n;
-    logic                   cmd_valid, cmd_ready;
+    logic clk, rst_n;
+    logic cmd_valid, cmd_ready;
     logic [`CMD_DESC_W-1:0] cmd_desc;
-    logic                   w_valid, w_ready;
-    logic [`W_RAW_BW-1:0]   w_data;
-    logic                   a_valid, a_ready;
-    logic [`A_BW-1:0]       a_data;
-    logic                   r_valid, r_ready;
-    logic [`R_BW-1:0]       r_data;
-    logic                   busy, done;
+    logic w_valid, w_ready;
+    logic [`W_RAW_BW-1:0] w_data;
+    logic a_valid, a_ready;
+    logic [`A_BW-1:0] a_data;
+    logic r_valid, r_ready;
+    logic [`R_BW-1:0] r_data;
+    logic busy, done;
 
     PATTERN u_pattern (
-        .clk       (clk),
-        .rst_n     (rst_n),
-        .cmd_valid (cmd_valid),
-        .cmd_ready (cmd_ready),
-        .cmd_desc  (cmd_desc),
-        .w_valid   (w_valid),
-        .w_ready   (w_ready),
-        .w_data    (w_data),
-        .a_valid   (a_valid),
-        .a_ready   (a_ready),
-        .a_data    (a_data),
-        .r_valid   (r_valid),
-        .r_ready   (r_ready),
-        .r_data    (r_data),
-        .busy      (busy),
-        .done      (done)
+        .clk(clk),
+        .rst_n(rst_n),
+        .cmd_valid(cmd_valid),
+        .cmd_ready(cmd_ready),
+        .cmd_desc(cmd_desc),
+        .w_valid(w_valid),
+        .w_ready(w_ready),
+        .w_data(w_data),
+        .a_valid(a_valid),
+        .a_ready(a_ready),
+        .a_data(a_data),
+        .r_valid(r_valid),
+        .r_ready(r_ready),
+        .r_data(r_data),
+        .busy(busy),
+        .done(done)
     );
 
     TPU u_dut (
-        .clk       (clk),
-        .rst_n     (rst_n),
-        .cmd_valid (cmd_valid),
-        .cmd_ready (cmd_ready),
-        .cmd_desc  (cmd_desc),
-        .w_valid   (w_valid),
-        .w_ready   (w_ready),
-        .w_data    (w_data),
-        .a_valid   (a_valid),
-        .a_ready   (a_ready),
-        .a_data    (a_data),
-        .r_valid   (r_valid),
-        .r_ready   (r_ready),
-        .r_data    (r_data),
-        .busy      (busy),
-        .done      (done)
+        .clk(clk),
+        .rst_n(rst_n),
+        .cmd_valid(cmd_valid),
+        .cmd_ready(cmd_ready),
+        .cmd_desc(cmd_desc),
+        .w_valid(w_valid),
+        .w_ready(w_ready),
+        .w_data(w_data),
+        .a_valid(a_valid),
+        .a_ready(a_ready),
+        .a_data(a_data),
+        .r_valid(r_valid),
+        .r_ready(r_ready),
+        .r_data(r_data),
+        .busy(busy),
+        .done(done)
     );
 
 endmodule

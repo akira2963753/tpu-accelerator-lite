@@ -28,13 +28,13 @@ module ACC (
     logic signed [`BIAS_W-1:0] active_bias [0:`ARRAY_S-1];
     logic signed [`ACC_W-1:0] psum_ext [0:`ARRAY_S-1];
 
-    always_comb begin
+    always_comb begin : PSUM_EXTEND
         for(int c = 0; c < `ARRAY_S; c++) begin
             psum_ext[c] = {{(`ACC_W-`PSUM_W){psum_i[`PSUM_W*(c+1)-1]}}, psum_i[`PSUM_W*c +: `PSUM_W]};
         end
     end
 
-    always_ff @(posedge clk or negedge rst_n) begin
+    always_ff @(posedge clk or negedge rst_n) begin : ACC_MEMORY
         if(!rst_n) begin
             for(int c = 0; c < `ARRAY_S; c++) begin
                 active_bias[c] <= 0;
@@ -43,30 +43,26 @@ module ACC (
         end
         else begin
             if(bias_wr_en) begin
-                for(int b = 0; b < `BIAS_PER_BEAT; b++)
-                    active_bias[bias_wr_beat*`BIAS_PER_BEAT+b] <=
-                        bias_data_i[`BIAS_CONTAINER_W*b +: `BIAS_W];
+                for(int b = 0; b < `BIAS_PER_BEAT; b++) 
+                    active_bias[bias_wr_beat*`BIAS_PER_BEAT+b] <= bias_data_i[`BIAS_CONTAINER_W*b +: `BIAS_W];
             end
 
             if(acc_clr) begin
-                for(int c = 0; c < `ARRAY_S; c++)
-                    for(int r = 0; r < `ARRAY_S; r++)
-                        acc_mem[c][r] <= acc_bias_en ? active_bias[c] : 0;
+                for(int c = 0; c < `ARRAY_S; c++) 
+                    for(int r = 0; r < `ARRAY_S; r++) 
+                        acc_mem[c][r] <= (acc_bias_en)? active_bias[c] : 0;
             end
             else begin
                 for(int c = 0; c < `ARRAY_S; c++) begin
-                    if(acc_wr_en[c])
-                        acc_mem[c][acc_wr_row[`ROW_IDX_W*c +: `ROW_IDX_W]] <=
-                            acc_mem[c][acc_wr_row[`ROW_IDX_W*c +: `ROW_IDX_W]] + psum_ext[c];
+                    if(acc_wr_en[c]) acc_mem[c][acc_wr_row[`ROW_IDX_W*c +: `ROW_IDX_W]] <= acc_mem[c][acc_wr_row[`ROW_IDX_W*c +: `ROW_IDX_W]] + psum_ext[c];
                 end
             end
         end
     end
 
-    always_comb begin
+    always_comb begin : ACC_READ
         acc_o = '0;
-        if(acc_rd_en)
-            for(int c = 0; c < `ARRAY_S; c++) acc_o[`ACC_W*c +: `ACC_W] = acc_mem[c][acc_rd_row];
+        if(acc_rd_en) for(int c = 0; c < `ARRAY_S; c++) acc_o[`ACC_W*c +: `ACC_W] = acc_mem[c][acc_rd_row];
     end
 
 endmodule

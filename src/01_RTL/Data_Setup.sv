@@ -21,10 +21,9 @@ module Data_Setup (
     logic [`A_W-1:0] skew [0:`ARRAY_S-1][0:`ARRAY_S-1];
     logic valid_skew [0:`ARRAY_S-1][0:`ARRAY_S-1];
 
-    genvar r;
     generate
-        for(r = 0; r < `ARRAY_S; r++) begin : SKEW_ROW
-            always_ff @(posedge clk or negedge rst_n) begin
+        for(genvar r = 0; r < `ARRAY_S; r++) begin : SKEW_ROW
+            always_ff @(posedge clk or negedge rst_n) begin : SKEW_PIPE
                 if(!rst_n) begin
                     for(int k = 0; k <= r; k++) begin
                         skew[r][k] <= 0;
@@ -43,7 +42,7 @@ module Data_Setup (
         end
     endgenerate
 
-    always_comb begin
+    always_comb begin : DATA_OUTPUT
         for(int r = 0; r < `ARRAY_S; r++) begin
             activation_o[`A_W*r +: `A_W] = skew[r][r];
             valid_o[r] = valid_skew[r][r];

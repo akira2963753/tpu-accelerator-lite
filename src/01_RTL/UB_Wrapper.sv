@@ -6,7 +6,6 @@
 * Module:       UB_Wrapper
 * Author:       Marco <harry2963753@gmail.com>
 *
-* Banked single-port memory wrapper.
 ******************************************************************************/
 
 module UB_Wrapper (
@@ -32,17 +31,18 @@ module UB_Wrapper (
         maddr = addr[`SRAM_ADDR_W-1:0];
     end
 
-    always_ff @(posedge clk) begin
+    always_ff @(posedge clk) begin : BANK_SELECT
         if(en && !we) bsel_q <= bsel;
     end
 
-    always_comb data_o = macro_data_o[bsel_q][0 +: `UB_DW];
+    always_comb begin : DATA_OUTPUT
+        data_o = macro_data_o[bsel_q][0 +: `UB_DW];
+    end
 
-    genvar b, m;
     generate
-        for(b = 0; b < `UB_BANKS; b = b + 1) begin : BANK_GEN
-            for(m = 0; m < `UB_WMACROS; m = m + 1) begin : WIDTH_GEN
-                TS1N16ADFPCLLLVTA512X45M4SWSHOD u_Unified_Buffer(
+        for(genvar b = 0; b < `UB_BANKS; b++) begin : BANK_GEN
+            for(genvar m = 0; m < `UB_WMACROS; m++) begin : WIDTH_GEN
+                TS1N16ADFPCLLLVTA512X45M4SWSHOD u_Unified_Buffer (
                     .CLK(clk),
                     .CEB(~(en && (bsel == b))),
                     .WEB(~(en && we && (bsel == b))),
@@ -55,7 +55,8 @@ module UB_Wrapper (
                     .SD(1'b0),
                     .PUDELAY(),
                     .RTSEL(2'b01),
-                    .WTSEL(2'b01));
+                    .WTSEL(2'b01)
+                );
             end
         end
     endgenerate

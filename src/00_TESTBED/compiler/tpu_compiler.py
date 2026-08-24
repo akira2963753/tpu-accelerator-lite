@@ -58,6 +58,21 @@ class LayerIR:
     weight_key: str
     bias_key: str
     activation: str
+    op_type: str = "linear"
+    input_tensor: str = ""
+    output_tensor: str = ""
+    input_shape: tuple = ()
+    output_shape: tuple = ()
+    kernel_size: tuple = (1, 1)
+    stride: tuple = (1, 1)
+    padding: tuple = (0, 0)
+    dilation: tuple = (1, 1)
+    groups: int = 1
+    bn_weight_key: str = ""
+    bn_bias_key: str = ""
+    bn_mean_key: str = ""
+    bn_var_key: str = ""
+    bn_eps: float = 1.0e-5
 
 
 @dataclass(frozen=True)
@@ -247,7 +262,7 @@ def accumulator_bound(raw_weight, bias_acc):
     return int(np.max(bound)) if bound.size else 0
 
 
-def exact_accumulate(payload, raw_weight, bias_acc, k_dim):
+def exact_accumulate(payload, raw_weight, bias_acc, k_dim, valid_mask=None):
     payload = np.asarray(payload, dtype=np.uint8)
     raw_weight = np.asarray(raw_weight, dtype=np.uint8)
     bias_acc = np.asarray(bias_acc, dtype=np.int64)
@@ -257,6 +272,11 @@ def exact_accumulate(payload, raw_weight, bias_acc, k_dim):
         raise ValueError("bias and weight output dimensions differ")
 
     activation = decode_activation_np(payload)
+    if valid_mask is not None:
+        valid_mask = np.asarray(valid_mask, dtype=bool)
+        if valid_mask.shape != payload.shape:
+            raise ValueError("activation payload and validity mask differ")
+        activation = np.where(valid_mask, activation, 0)
     weight = effective_weight_np(raw_weight)
     accumulator = np.broadcast_to(
         bias_acc.reshape(1, -1),
@@ -386,6 +406,100 @@ def sha256_file(path):
     return digest.hexdigest()
 
 
+def pair(value, name):
+    if isinstance(value, int):
+        result = (int(value), int(value))
+    else:
+        result = tuple(int(item) for item in value)
+    if len(result) != 2 or any(item < 0 for item in result):
+        raise ValueError("%s must contain two non-negative integers" % name)
+    return result
+
+
+def conv_output_shape(input_shape, out_channels, kernel_size, stride,
+                      padding, dilation):
+    _channels, height, width = input_shape
+    output_height = (
+        height + 2 * padding[0] - dilation[0] * (kernel_size[0] - 1) - 1
+    ) // stride[0] + 1
+    output_width = (
+        width + 2 * padding[1] - dilation[1] * (kernel_size[1] - 1) - 1
+    ) // stride[1] + 1
+    if output_height <= 0 or output_width <= 0:
+        raise ValueError("Conv2D output has a non-positive spatial dimension")
+    return int(out_channels), output_height, output_width
+
+
+def fold_batch_norm(weight, bias, tensors, layer):
+    weight = np.asarray(weight, dtype=np.float64)
+    bias = np.asarray(bias, dtype=np.float64)
+    if not layer.bn_weight_key:
+        return weight, bias
+    gamma = np.asarray(tensors[layer.bn_weight_key], dtype=np.float64)
+    beta = np.asarray(tensors[layer.bn_bias_key], dtype=np.float64)
+    mean = np.asarray(tensors[layer.bn_mean_key], dtype=np.float64)
+    variance = np.asarray(tensors[layer.bn_var_key], dtype=np.float64)
+    factor = gamma / np.sqrt(variance + layer.bn_eps)
+    reshape = (factor.shape[0],) + (1,) * (weight.ndim - 1)
+    folded_weight = weight * factor.reshape(reshape)
+    folded_bias = beta + (bias - mean) * factor
+    return folded_weight, folded_bias
+
+
+def im2col_payload(payload, layer):
+    payload = np.asarray(payload, dtype=np.uint8)
+    if payload.ndim != 4:
+        raise ValueError("Conv2D input payload must use NCHW layout")
+    batch, channels, height, width = payload.shape
+    if (channels, height, width) != layer.input_shape:
+        raise ValueError("Conv2D input tensor shape mismatch for %s" % layer.name)
+    output_channels, output_height, output_width = layer.output_shape
+    kernel_height, kernel_width = layer.kernel_size
+    matrix = np.zeros(
+        (batch * output_height * output_width, layer.in_features),
+        dtype=np.uint8,
+    )
+    valid = np.zeros(matrix.shape, dtype=bool)
+    row = 0
+    for batch_index in range(batch):
+        for output_row in range(output_height):
+            for output_column in range(output_width):
+                column = 0
+                for channel in range(channels):
+                    for kernel_row in range(kernel_height):
+                        input_row = (
+                            output_row * layer.stride[0] - layer.padding[0] +
+                            kernel_row * layer.dilation[0]
+                        )
+                        for kernel_column in range(kernel_width):
+                            input_column = (
+                                output_column * layer.stride[1] -
+                                layer.padding[1] +
+                                kernel_column * layer.dilation[1]
+                            )
+                            if (0 <= input_row < height and
+                                    0 <= input_column < width):
+                                matrix[row, column] = payload[
+                                    batch_index,
+                                    channel,
+                                    input_row,
+                                    input_column,
+                                ]
+                                valid[row, column] = True
+                            column += 1
+                row += 1
+    return matrix, valid
+
+
+def matrix_to_nchw(matrix, batch, output_shape):
+    channels, height, width = output_shape
+    matrix = np.asarray(matrix)
+    expected = (batch * height * width, channels)
+    if matrix.shape != expected:
+        raise ValueError("matrix output shape does not match NCHW tensor")
+    return matrix.reshape(batch, height, width, channels).transpose(0, 3, 1, 2)
+
+
 def load_model(model_path):
     model_path = os.path.abspath(model_path)
     with open(model_path, "r", encoding="utf-8") as source:
@@ -398,41 +512,127 @@ def load_model(model_path):
     with np.load(tensor_path, allow_pickle=False) as archive:
         tensors = {name: archive[name] for name in archive.files}
     layers = []
-    previous_features = int(model["input_features"])
+    previous_features = int(model.get("input_features", 0))
+    root_input = model.get("input", {}).get("name", "input")
+    previous_tensor = root_input
+    available_tensors = {root_input}
     for entry in model["layers"]:
-        if entry.get("type", "linear").lower() != "linear":
-            raise ValueError(
-                "operator %s is not lowered to GEMM yet" % entry.get("type")
-            )
+        op_type = entry.get("type", "linear").lower()
+        if op_type not in ("linear", "conv2d"):
+            raise ValueError("unsupported TPU operator %s" % op_type)
         activation = entry.get("activation", "none").lower()
         if activation not in ("none", "relu"):
             raise ValueError("unsupported activation %s" % activation)
-        layer = LayerIR(
-            name=entry["name"],
-            in_features=int(entry["in_features"]),
-            out_features=int(entry["out_features"]),
-            weight_key=entry["weight"],
-            bias_key=entry.get("bias", ""),
-            activation=activation,
-        )
-        if layer.in_features != previous_features:
-            raise ValueError("layer %s has a broken feature chain" % layer.name)
+        input_tensor = entry.get("input", previous_tensor)
+        output_tensor = entry.get("output", entry["name"] + "_output")
+        if input_tensor not in available_tensors:
+            raise ValueError("layer %s uses unavailable tensor %s" %
+                             (entry["name"], input_tensor))
+        if op_type == "linear":
+            layer = LayerIR(
+                name=entry["name"],
+                in_features=int(entry["in_features"]),
+                out_features=int(entry["out_features"]),
+                weight_key=entry["weight"],
+                bias_key=entry.get("bias", ""),
+                activation=activation,
+                op_type=op_type,
+                input_tensor=input_tensor,
+                output_tensor=output_tensor,
+            )
+            if layer.in_features != previous_features:
+                raise ValueError("layer %s has a broken feature chain" % layer.name)
+            if tuple(tensors[layer.weight_key].shape) != (
+                    layer.out_features, layer.in_features):
+                raise ValueError("layer %s weight shape must be [N,K]" % layer.name)
+        else:
+            input_shape = tuple(int(value) for value in entry["input_shape"])
+            if len(input_shape) != 3:
+                raise ValueError("Conv2D input_shape must be [C,H,W]")
+            in_channels = int(entry["in_channels"])
+            out_channels = int(entry["out_channels"])
+            kernel_size = pair(entry["kernel_size"], "kernel_size")
+            stride = pair(entry.get("stride", 1), "stride")
+            padding = pair(entry.get("padding", 0), "padding")
+            dilation = pair(entry.get("dilation", 1), "dilation")
+            if any(value == 0 for value in kernel_size + stride + dilation):
+                raise ValueError(
+                    "kernel_size, stride and dilation must be positive"
+                )
+            groups = int(entry.get("groups", 1))
+            if groups != 1:
+                raise ValueError("Conv2D groups other than 1 are not implemented")
+            if input_shape[0] != in_channels:
+                raise ValueError("Conv2D input channel metadata mismatch")
+            output_shape = conv_output_shape(
+                input_shape, out_channels, kernel_size, stride, padding, dilation
+            )
+            declared_output = tuple(
+                int(value) for value in entry.get("output_shape", output_shape)
+            )
+            if declared_output != output_shape:
+                raise ValueError("Conv2D output_shape metadata mismatch")
+            batch_norm = entry.get("batch_norm", {})
+            layer = LayerIR(
+                name=entry["name"],
+                in_features=in_channels * kernel_size[0] * kernel_size[1],
+                out_features=out_channels,
+                weight_key=entry["weight"],
+                bias_key=entry.get("bias", ""),
+                activation=activation,
+                op_type=op_type,
+                input_tensor=input_tensor,
+                output_tensor=output_tensor,
+                input_shape=input_shape,
+                output_shape=output_shape,
+                kernel_size=kernel_size,
+                stride=stride,
+                padding=padding,
+                dilation=dilation,
+                groups=groups,
+                bn_weight_key=batch_norm.get("weight", ""),
+                bn_bias_key=batch_norm.get("bias", ""),
+                bn_mean_key=batch_norm.get("running_mean", ""),
+                bn_var_key=batch_norm.get("running_var", ""),
+                bn_eps=float(batch_norm.get("eps", 1.0e-5)),
+            )
+            expected_weight = (
+                out_channels, in_channels, kernel_size[0], kernel_size[1]
+            )
+            if tuple(tensors[layer.weight_key].shape) != expected_weight:
+                raise ValueError("layer %s weight shape must be OIHW" % layer.name)
+            if layer.bn_weight_key:
+                for key in (
+                    layer.bn_weight_key,
+                    layer.bn_bias_key,
+                    layer.bn_mean_key,
+                    layer.bn_var_key,
+                ):
+                    if key not in tensors or tuple(tensors[key].shape) != (
+                            out_channels,):
+                        raise ValueError("layer %s BatchNorm tensor mismatch" %
+                                         layer.name)
         if layer.in_features > tc.K_MAX or layer.out_features > tc.N_MAX:
             raise ValueError("layer %s exceeds TPU dimensions" % layer.name)
-        weight = tensors[layer.weight_key]
-        if tuple(weight.shape) != (layer.out_features, layer.in_features):
-            raise ValueError("layer %s weight shape must be [N,K]" % layer.name)
         if (layer.bias_key and
                 tuple(tensors[layer.bias_key].shape) != (layer.out_features,)):
             raise ValueError("layer %s bias shape mismatch" % layer.name)
         layers.append(layer)
         previous_features = layer.out_features
+        previous_tensor = output_tensor
+        available_tensors.add(output_tensor)
     if not layers:
-        raise ValueError("model has no Linear layers")
+        raise ValueError("model has no TPU layers")
+    for operation in model.get("host_operations", []):
+        if operation.get("type") != "add":
+            raise ValueError("unsupported Host operator %s" % operation.get("type"))
+        if any(name not in available_tensors for name in operation["inputs"]):
+            raise ValueError("Host add uses an unavailable tensor")
+        available_tensors.add(operation["output"])
     return model_path, model, tensors, layers
 
 
-def compile_quantized_layers(model_path):
+def compile_linear_quantized_layers(model_path):
     model_path, model, tensors, layers = load_model(model_path)
     if "calibration_inputs" not in tensors:
         raise ValueError("tensor package has no calibration_inputs")
@@ -538,6 +738,177 @@ def compile_quantized_layers(model_path):
     return model_path, model, tensors, quantized_layers
 
 
+def compile_conv_quantized_layers(model_path):
+    model_path, source_model, tensors, layers = load_model(model_path)
+    if "calibration_inputs" not in tensors:
+        raise ValueError("tensor package has no calibration_inputs")
+    root_name = source_model.get("input", {}).get("name", "input")
+    root_values = np.asarray(tensors["calibration_inputs"], dtype=np.float64)
+    declared_shape = tuple(
+        int(value) for value in source_model["input"]["shape"][1:]
+    )
+    if root_values.ndim != 4 or tuple(root_values.shape[1:]) != declared_shape:
+        raise ValueError("calibration input shape mismatch")
+
+    tensor_states = {
+        root_name: {
+            "float": root_values,
+            "payload": None,
+            "scale": None,
+        }
+    }
+    quantized_layers = []
+    for layer in layers:
+        if layer.op_type != "conv2d":
+            raise ValueError("mixed Linear and Conv2D graphs are not implemented")
+        state = tensor_states[layer.input_tensor]
+        input_float = np.asarray(state["float"], dtype=np.float64)
+        input_scale = state["scale"]
+        input_payload = state["payload"]
+        if input_scale is None:
+            input_scale = choose_a5_scale(input_float)
+        if input_payload is None:
+            input_payload = quantize_activation(input_float, input_scale)
+
+        weight = np.asarray(tensors[layer.weight_key], dtype=np.float64)
+        bias = np.asarray(tensors[layer.bias_key], dtype=np.float64) \
+            if layer.bias_key else np.zeros(layer.out_features, dtype=np.float64)
+        weight, bias = fold_batch_norm(weight, bias, tensors, layer)
+        weight_nk = weight.reshape(layer.out_features, layer.in_features)
+        raw_weight_nk, weight_scale, weight_stats = quantize_weight(weight_nk)
+        raw_weight = raw_weight_nk.T.copy()
+        accumulator_scale = input_scale * weight_scale
+        bias_acc, bias_stats = quantize_bias(bias, accumulator_scale)
+        worst_accumulator = accumulator_bound(raw_weight, bias_acc)
+
+        activation_matrix, valid_mask = im2col_payload(input_payload, layer)
+        accumulator = exact_accumulate(
+            activation_matrix,
+            raw_weight,
+            bias_acc,
+            layer.in_features,
+            valid_mask,
+        )
+        act_mode = tc.ACT_RELU if layer.activation == "relu" else tc.ACT_NONE
+        activation_float = decode_activation_np(
+            activation_matrix
+        ).astype(np.float64) * input_scale
+        activation_float = np.where(valid_mask, activation_float, 0.0)
+        effective_weight = effective_weight_np(
+            raw_weight_nk
+        ).astype(np.float64) * weight_scale
+        reference_matrix = np.matmul(
+            activation_float, effective_weight.T
+        ) + bias
+        if act_mode == tc.ACT_RELU:
+            reference_matrix = np.maximum(reference_matrix, 0.0)
+
+        output_scale = choose_a5_scale(reference_matrix)
+        requant_factor = accumulator_scale / (2.0 * output_scale)
+        qmult, qshift = encode_requant_factor(requant_factor)
+        output_matrix, output_stats = output_payload_np(
+            accumulator, qmult, qshift, act_mode
+        )
+        ideal_payload = quantize_activation(reference_matrix, output_scale)
+        reconstructed = decode_activation_np(
+            output_matrix
+        ).astype(np.float64) * output_scale
+        encoded_factor = qmult / float(1 << qshift)
+        stats = {
+            "activation": activation_stats(input_float, input_scale),
+            "weight": weight_stats,
+            "bias": bias_stats,
+            "output": output_stats,
+            "requant": {
+                "target_factor": requant_factor,
+                "encoded_factor": encoded_factor,
+                "relative_factor_error": abs(
+                    encoded_factor - requant_factor
+                ) / requant_factor,
+                "payload_mismatch": int(np.count_nonzero(
+                    output_matrix != ideal_payload
+                )),
+                "total": int(output_matrix.size),
+                "reconstruction_mse": float(np.mean(
+                    (reconstructed - reference_matrix) ** 2
+                )),
+                "mode": "scale",
+                "rank": None,
+            },
+            "accumulator_min": int(np.min(accumulator)),
+            "accumulator_max": int(np.max(accumulator)),
+            "accumulator_worst_case_bound": worst_accumulator,
+            "masked_elements": int(np.count_nonzero(~valid_mask)),
+            "matrix_elements": int(valid_mask.size),
+        }
+        quantized_layers.append(QuantizedLayer(
+            ir=layer,
+            raw_weight=raw_weight,
+            bias_acc=bias_acc,
+            weight_scale=weight_scale,
+            input_scale=input_scale,
+            output_scale=output_scale,
+            qmult=qmult,
+            qshift=qshift,
+            act_mode=act_mode,
+            stats=stats,
+        ))
+        batch = input_payload.shape[0]
+        tensor_states[layer.output_tensor] = {
+            "float": matrix_to_nchw(
+                reference_matrix, batch, layer.output_shape
+            ),
+            "payload": matrix_to_nchw(
+                output_matrix, batch, layer.output_shape
+            ),
+            "scale": output_scale,
+        }
+
+    model = dict(source_model)
+    host_operations = []
+    for operation in source_model.get("host_operations", []):
+        if operation["type"] != "add":
+            raise ValueError("unsupported Host operator")
+        left = tensor_states[operation["inputs"][0]]
+        right = tensor_states[operation["inputs"][1]]
+        left_values = decode_activation_np(left["payload"]) * left["scale"]
+        right_values = decode_activation_np(right["payload"]) * right["scale"]
+        output_values = left_values + right_values
+        if operation.get("activation", "none") == "relu":
+            output_values = np.maximum(output_values, 0.0)
+        output_scale = choose_a5_scale(output_values)
+        output_payload = quantize_activation(output_values, output_scale)
+        tensor_states[operation["output"]] = {
+            "float": decode_activation_np(output_payload) * output_scale,
+            "payload": output_payload,
+            "scale": output_scale,
+        }
+        compiled_operation = dict(operation)
+        compiled_operation["input_scales"] = [left["scale"], right["scale"]]
+        compiled_operation["output_scale"] = output_scale
+        compiled_operation["stats"] = {
+            "activation": activation_stats(output_values, output_scale),
+            "minimum": float(np.min(output_values)),
+            "maximum": float(np.max(output_values)),
+        }
+        host_operations.append(compiled_operation)
+    model["host_operations"] = host_operations
+    return model_path, model, tensors, quantized_layers
+
+
+def compile_quantized_layers(model_path):
+    _path, _model, _tensors, layers = load_model(model_path)
+    if all(layer.op_type == "linear" for layer in layers):
+        return compile_linear_quantized_layers(model_path)
+    if all(layer.op_type == "conv2d" for layer in layers):
+        return compile_conv_quantized_layers(model_path)
+    raise ValueError("mixed Linear and Conv2D graphs are not implemented")
+
+
+def layer_has_bias(layer):
+    return bool(layer.ir.bias_key or layer.ir.bn_weight_key)
+
+
 def write_compiled_model(outdir, model_path, model, layers):
     os.makedirs(outdir, exist_ok=True)
     tensor_name = "compiled_model.npz"
@@ -551,11 +922,20 @@ def write_compiled_model(outdir, model_path, model, layers):
         arrays[bias_key] = layer.bias_acc.astype(np.int64)
         entries.append({
             "name": layer.ir.name,
-            "type": "linear",
+            "type": layer.ir.op_type,
             "in_features": layer.ir.in_features,
             "out_features": layer.ir.out_features,
+            "input": layer.ir.input_tensor,
+            "output": layer.ir.output_tensor,
+            "input_shape": list(layer.ir.input_shape),
+            "output_shape": list(layer.ir.output_shape),
+            "kernel_size": list(layer.ir.kernel_size),
+            "stride": list(layer.ir.stride),
+            "padding": list(layer.ir.padding),
+            "dilation": list(layer.ir.dilation),
+            "groups": layer.ir.groups,
             "activation": layer.ir.activation,
-            "has_bias": bool(layer.ir.bias_key),
+            "has_bias": layer_has_bias(layer),
             "raw_weight": weight_key,
             "bias_acc": bias_key,
             "weight_scale": layer.weight_scale,
@@ -575,8 +955,11 @@ def write_compiled_model(outdir, model_path, model, layers):
         "format": COMPILED_FORMAT,
         "name": model.get("name", "model"),
         "source_model": os.path.basename(model_path),
-        "input_features": int(model["input_features"]),
+        "input_features": int(model.get("input_features", 0)),
+        "input": model.get("input"),
+        "output": model.get("output"),
         "output_semantics": output_semantics or "tensor",
+        "host_operations": model.get("host_operations", []),
         "target": asdict(TargetSpec()),
         "tensor_file": tensor_name,
         "tensor_sha256": sha256_file(tensor_path),
@@ -615,6 +998,16 @@ def load_compiled_model(compiled_path):
             weight_key=entry["raw_weight"],
             bias_key="compiled_bias" if entry["has_bias"] else "",
             activation=entry["activation"],
+            op_type=entry.get("type", "linear"),
+            input_tensor=entry.get("input", ""),
+            output_tensor=entry.get("output", ""),
+            input_shape=tuple(entry.get("input_shape", [])),
+            output_shape=tuple(entry.get("output_shape", [])),
+            kernel_size=tuple(entry.get("kernel_size", [1, 1])),
+            stride=tuple(entry.get("stride", [1, 1])),
+            padding=tuple(entry.get("padding", [0, 0])),
+            dilation=tuple(entry.get("dilation", [1, 1])),
+            groups=int(entry.get("groups", 1)),
         )
         layers.append(QuantizedLayer(
             ir=ir,
@@ -631,7 +1024,10 @@ def load_compiled_model(compiled_path):
     model = {
         "name": document["name"],
         "input_features": int(document["input_features"]),
+        "input": document.get("input"),
+        "output": document.get("output"),
         "output_semantics": document.get("output_semantics", "tensor"),
+        "host_operations": document.get("host_operations", []),
         "layers": document["layers"],
     }
     return compiled_path, model, layers
@@ -693,7 +1089,7 @@ def pack_output_tile_np(output, mt, nt):
     return rows
 
 
-def build_workload(model_path, rtl_inputs, rtl_labels=None, compiled=None):
+def build_linear_workload(model_path, rtl_inputs, rtl_labels=None, compiled=None):
     if compiled is None:
         model_path, model, _tensors, layers = compile_quantized_layers(model_path)
     else:
@@ -937,6 +1333,338 @@ def build_workload(model_path, rtl_inputs, rtl_labels=None, compiled=None):
     )
 
 
+def emit_conv_layer(layer, input_payload, commands, weight_rows,
+                    activation_rows, golden_rows):
+    ir = layer.ir
+    target = TargetSpec()
+    activation, valid_mask = im2col_payload(input_payload, ir)
+    m_dim = int(activation.shape[0])
+    if m_dim > tc.M_MAX:
+        raise ValueError(
+            "Conv2D layer %s has M=%d; split batches before RTL emit" %
+            (ir.name, m_dim)
+        )
+    mt_total = ceil_div(m_dim, target.array_size)
+    kt_total = ceil_div(ir.in_features, target.array_size)
+    nt_total = ceil_div(ir.out_features, target.array_size)
+    nt_block_capacity = target.wmem_slots // kt_total
+    if nt_block_capacity == 0:
+        raise ValueError("layer %s K tiles exceed WMEM capacity" % ir.name)
+    nt_block_capacity = min(nt_total, nt_block_capacity)
+    weight_blocks = []
+    for nt_begin in range(0, nt_total, nt_block_capacity):
+        weight_blocks.append({
+            "nt_begin": nt_begin,
+            "nt_count": min(nt_block_capacity, nt_total - nt_begin),
+        })
+
+    m_pad = mt_total * target.array_size
+    k_pad = kt_total * target.array_size
+    n_pad = nt_total * target.array_size
+    padded_activation = pad_payload(activation, m_pad, k_pad)
+    padded_mask = np.zeros((m_pad, k_pad), dtype=bool)
+    padded_mask[:m_dim, :ir.in_features] = valid_mask
+    padded_weight = pad_weight(layer.raw_weight, k_pad, n_pad)
+    padded_bias = np.zeros(n_pad, dtype=np.int64)
+    padded_bias[:ir.out_features] = layer.bias_acc
+
+    accumulator = exact_accumulate(
+        padded_activation,
+        padded_weight,
+        padded_bias,
+        ir.in_features,
+        padded_mask,
+    )
+    padded_output, rtl_output_stats = output_payload_np(
+        accumulator, layer.qmult, layer.qshift, layer.act_mode
+    )
+    output = padded_output[:m_dim, :ir.out_features].copy()
+
+    layer_start = len(commands)
+    masked_loads = 0
+    activation_loads = 0
+    for block in weight_blocks:
+        nt_begin = block["nt_begin"]
+        nt_count = block["nt_count"]
+        for local_nt in range(nt_count):
+            nt = nt_begin + local_nt
+            for kt in range(kt_total):
+                w_slot = kt * nt_count + local_nt
+                command = tc.make_command(
+                    tc.CMD_OP_LOAD_W, kt=kt, nt=nt, w_slot=w_slot
+                )
+                commands.append(command)
+                weight_rows.extend(pack_weight_tile_np(padded_weight, kt, nt))
+
+        for local_nt in range(nt_count):
+            nt = nt_begin + local_nt
+            if layer_has_bias(layer):
+                bias = padded_bias[
+                    nt * target.array_size:(nt + 1) * target.array_size
+                ]
+                commands.append(tc.make_command(tc.CMD_OP_LOAD_BIAS, nt=nt))
+                weight_rows.extend(tg.pack_bias([int(value) for value in bias]))
+
+            for mt in range(mt_total):
+                for kt in range(kt_total):
+                    k_valid = min(
+                        target.array_size,
+                        ir.in_features - kt * target.array_size,
+                    )
+                    row_begin = mt * target.array_size
+                    column_begin = kt * target.array_size
+                    tile_mask = padded_mask[
+                        row_begin:row_begin + target.array_size,
+                        column_begin:column_begin + target.array_size,
+                    ]
+                    a_mask_en = not np.all(tile_mask[:, :k_valid])
+                    commands.append(tc.make_command(
+                        tc.CMD_OP_LOAD_A,
+                        mt=mt,
+                        kt=kt,
+                        src_slot=0,
+                        a_mask_en=a_mask_en,
+                    ))
+                    activation_rows.extend(pack_activation_tile_np(
+                        padded_activation, mt, kt
+                    ))
+                    if a_mask_en:
+                        activation_rows.extend(tg.pack_activation_mask(
+                            tile_mask.tolist()
+                        ))
+                        masked_loads += 1
+                    activation_loads += 1
+
+                    w_slot = kt * nt_count + local_nt
+                    commands.append(tc.make_command(
+                        tc.CMD_OP_PRELOAD_W,
+                        mt=mt,
+                        kt=kt,
+                        nt=nt,
+                        w_slot=w_slot,
+                    ))
+                    commands.append(tc.make_command(
+                        tc.CMD_OP_GEMM,
+                        mt=mt,
+                        kt=kt,
+                        nt=nt,
+                        w_slot=w_slot,
+                        src_slot=0,
+                        acc_init=(kt == 0),
+                        acc_final=(kt == kt_total - 1),
+                        k_valid=k_valid,
+                        bias_en=(kt == 0 and layer_has_bias(layer)),
+                    ))
+
+                commands.append(tc.make_command(
+                    tc.CMD_OP_STORE_C,
+                    qmult=layer.qmult,
+                    qshift=layer.qshift,
+                    mt=mt,
+                    kt=kt_total - 1,
+                    nt=nt,
+                    dst_slot=1,
+                    act_mode=layer.act_mode,
+                ))
+                golden_rows.extend(pack_output_tile_np(padded_output, mt, nt))
+
+    batch = input_payload.shape[0]
+    output_tensor = matrix_to_nchw(output, batch, ir.output_shape)
+    manifest = {
+        "name": ir.name,
+        "type": ir.op_type,
+        "input_tensor": ir.input_tensor,
+        "output_tensor": ir.output_tensor,
+        "input_shape": [batch] + list(ir.input_shape),
+        "output_shape": [batch] + list(ir.output_shape),
+        "shape": {"M": m_dim, "K": ir.in_features, "N": ir.out_features},
+        "tiles": {"MT": mt_total, "KT": kt_total, "NT": nt_total},
+        "kernel_size": list(ir.kernel_size),
+        "stride": list(ir.stride),
+        "padding": list(ir.padding),
+        "activation": ir.activation,
+        "act_mode": layer.act_mode,
+        "qmult": layer.qmult,
+        "qshift": layer.qshift,
+        "input_scale": layer.input_scale,
+        "weight_scale": layer.weight_scale,
+        "output_scale": layer.output_scale,
+        "weight_tiles": kt_total * nt_total,
+        "weight_slots": kt_total * nt_block_capacity,
+        "weight_blocks": weight_blocks,
+        "activation_loads": activation_loads,
+        "masked_loads": masked_loads,
+        "command_begin": layer_start,
+        "command_count": len(commands) - layer_start,
+        "stats": dict(layer.stats, rtl_output=rtl_output_stats),
+    }
+    return output_tensor, manifest
+
+
+def execute_host_operations(model, tensor_states):
+    manifests = []
+    for operation in model.get("host_operations", []):
+        left = tensor_states[operation["inputs"][0]]
+        right = tensor_states[operation["inputs"][1]]
+        left_values = decode_activation_np(left["payload"]) * left["scale"]
+        right_values = decode_activation_np(right["payload"]) * right["scale"]
+        output_values = left_values + right_values
+        if operation.get("activation", "none") == "relu":
+            output_values = np.maximum(output_values, 0.0)
+        output_scale = float(
+            operation.get("output_scale", choose_a5_scale(output_values))
+        )
+        output_payload = quantize_activation(output_values, output_scale)
+        tensor_states[operation["output"]] = {
+            "payload": output_payload,
+            "scale": output_scale,
+            "float": decode_activation_np(output_payload) * output_scale,
+        }
+        manifests.append({
+            "name": operation["name"],
+            "type": operation["type"],
+            "inputs": list(operation["inputs"]),
+            "output": operation["output"],
+            "activation": operation.get("activation", "none"),
+            "input_scales": [left["scale"], right["scale"]],
+            "output_scale": output_scale,
+            "output_shape": list(output_payload.shape),
+            "payload_sha256": hashlib.sha256(
+                output_payload.tobytes()
+            ).hexdigest(),
+        })
+    return manifests
+
+
+def build_conv_workload(model_path, rtl_inputs, rtl_labels=None, compiled=None,
+                        rtl_reference_outputs=None):
+    if compiled is None:
+        model_path, model, _tensors, layers = compile_quantized_layers(model_path)
+    else:
+        model_path, model, layers = compiled
+    rtl_inputs = np.asarray(rtl_inputs, dtype=np.float64)
+    root_shape = tuple(int(value) for value in model["input"]["shape"][1:])
+    if rtl_inputs.ndim != 4 or tuple(rtl_inputs.shape[1:]) != root_shape:
+        raise ValueError("RTL Conv2D input shape mismatch")
+
+    root_name = model["input"]["name"]
+    tensor_states = {
+        root_name: {
+            "float": rtl_inputs,
+            "payload": None,
+            "scale": None,
+        }
+    }
+    commands = []
+    weight_rows = []
+    activation_rows = []
+    golden_rows = []
+    layer_manifest = []
+
+    for layer in layers:
+        state = tensor_states[layer.ir.input_tensor]
+        if state["payload"] is None or not math.isclose(
+                state["scale"] or layer.input_scale,
+                layer.input_scale,
+                rel_tol=1.0e-12,
+                abs_tol=0.0):
+            input_payload = quantize_activation(
+                state["float"], layer.input_scale
+            )
+        else:
+            input_payload = state["payload"]
+        output_payload, manifest = emit_conv_layer(
+            layer,
+            input_payload,
+            commands,
+            weight_rows,
+            activation_rows,
+            golden_rows,
+        )
+        tensor_states[layer.ir.output_tensor] = {
+            "payload": output_payload,
+            "scale": layer.output_scale,
+            "float": decode_activation_np(output_payload) * layer.output_scale,
+        }
+        layer_manifest.append(manifest)
+
+    host_manifest = execute_host_operations(model, tensor_states)
+    output_name = model.get("output", {}).get("name")
+    final_state = tensor_states.get(output_name) if output_name else None
+    reference_metrics = None
+    if rtl_reference_outputs is not None and final_state is not None:
+        reference = np.asarray(rtl_reference_outputs, dtype=np.float64)
+        if reference.shape != final_state["float"].shape:
+            raise ValueError("RTL reference output shape mismatch")
+        difference = final_state["float"] - reference
+        reference_metrics = {
+            "mse": float(np.mean(difference * difference)),
+            "maximum_absolute_error": float(np.max(np.abs(difference))),
+        }
+
+    replay_rows = tg.replay_commands(commands, weight_rows, activation_rows)
+    if replay_rows != golden_rows:
+        mismatch = next(
+            index
+            for index, pair in enumerate(zip(replay_rows, golden_rows))
+            if pair[0] != pair[1]
+        )
+        raise AssertionError(
+            "Conv2D golden differs from command replay at row %d" % mismatch
+        )
+
+    first_shape = layer_manifest[0]["shape"]
+    manifest = {
+        "format": BUNDLE_FORMAT,
+        "name": model.get("name", "conv_model"),
+        "source_model": os.path.basename(model_path),
+        "target": asdict(TargetSpec()),
+        "test": {
+            "name": model.get("name", "conv_model") + "_rtl",
+            "M": first_shape["M"],
+            "K": first_shape["K"],
+            "N": first_shape["N"],
+            "command_count": len(commands),
+            "weight_rows": len(weight_rows),
+            "activation_rows": len(activation_rows),
+            "golden_rows": len(golden_rows),
+        },
+        "layers": layer_manifest,
+        "host_operations": host_manifest,
+        "reference_metrics": reference_metrics,
+        "labels": None if rtl_labels is None else
+            np.asarray(rtl_labels, dtype=np.int64).tolist(),
+        "predictions": [],
+        "rtl_batch_accuracy": None,
+        "files": {},
+    }
+    return WorkloadBundle(
+        commands=commands,
+        weight_rows=weight_rows,
+        activation_rows=activation_rows,
+        golden_rows=golden_rows,
+        manifest=manifest,
+    )
+
+
+def build_workload(model_path, rtl_inputs, rtl_labels=None, compiled=None,
+                   rtl_reference_outputs=None):
+    if compiled is None:
+        probe = compile_quantized_layers(model_path)
+        compiled = (probe[0], probe[1], probe[3])
+    if all(layer.ir.op_type == "linear" for layer in compiled[2]):
+        return build_linear_workload(
+            model_path, rtl_inputs, rtl_labels, compiled=compiled
+        )
+    return build_conv_workload(
+        model_path,
+        rtl_inputs,
+        rtl_labels,
+        compiled=compiled,
+        rtl_reference_outputs=rtl_reference_outputs,
+    )
+
+
 def write_test_suite(path, bundle):
     test = bundle.manifest["test"]
     with open(path, "w", newline="\n") as output:
@@ -987,7 +1715,7 @@ def write_test_suite(path, bundle):
         output.write("    localparam int TEST_ASTALL     [NUM_TESTS] = '{0};\n")
         output.write(
             "    localparam string TEST_NAME [NUM_TESTS] = "
-            "'{\"mnist_mlp\"};\n"
+            "'{\"%s\"};\n" % test["name"]
         )
 
 
@@ -1013,7 +1741,11 @@ def write_summary(path, bundle):
                  tiles["MT"], tiles["KT"], tiles["NT"], layer["qmult"],
                  layer["qshift"], layer["activation"], layer["command_count"])
             )
-        output.write("predictions    : %s\n" % manifest["predictions"])
+        if manifest.get("host_operations"):
+            output.write("host operators : %d\n" %
+                         len(manifest["host_operations"]))
+        if manifest.get("predictions"):
+            output.write("predictions    : %s\n" % manifest["predictions"])
         if manifest["rtl_batch_accuracy"] is not None:
             output.write("batch accuracy : %.4f\n" % manifest["rtl_batch_accuracy"])
 
@@ -1138,8 +1870,17 @@ def emit_test_command(args):
                                           args.sample_offset + args.batch_size]
     if rtl_inputs.shape[0] != args.batch_size:
         raise ValueError("requested RTL batch is not available")
+    rtl_reference_outputs = None
+    if "rtl_reference_outputs" in tensors:
+        rtl_reference_outputs = tensors["rtl_reference_outputs"][
+            args.sample_offset:args.sample_offset + args.batch_size
+        ]
     bundle = build_workload(
-        args.compiled, rtl_inputs, labels, compiled=compiled
+        args.compiled,
+        rtl_inputs,
+        labels,
+        compiled=compiled,
+        rtl_reference_outputs=rtl_reference_outputs,
     )
     outdir = os.path.abspath(
         args.outdir or os.path.join(TESTBED_ROOT, "pattern")

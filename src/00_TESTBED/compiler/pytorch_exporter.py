@@ -80,6 +80,12 @@ def export_package(model, model_ir, datasets, outdir, tensor_name):
             if tensor_key:
                 tensors[tensor_key] = state[tensor_key].detach().cpu().numpy() \
                     .astype(np.float32)
+        batch_norm = operation.get("batch_norm", {})
+        for field in ("weight", "bias", "running_mean", "running_var"):
+            tensor_key = batch_norm.get(field, "")
+            if tensor_key:
+                tensors[tensor_key] = state[tensor_key].detach().cpu().numpy() \
+                    .astype(np.float32)
 
     np.savez_compressed(os.path.join(outdir, tensor_name), **tensors)
     document = dict(model_ir)

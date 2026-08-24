@@ -1,0 +1,20 @@
+{
+  "format": "tpu-dat-b85-v1",
+  "source_name": "t00_weight.dat",
+  "source_size": 1138632,
+  "source_sha256": "763680d140d0de7d628c1a04c28f79c64f89c3ab31d3c1e4f4aaecea30ca46d9",
+  "raw_size": 552064,
+  "compressed_size": 435283,
+  "compressed_sha256": "b806ae51d6520a34634ca8cd3e898d701338dd6114c0627eda39719d5b546aa3",
+  "payload_chars": 544104,
+  "chunk_size": 50000,
+  "part_count": 11,
+  "line_count": 17252,
+  "line_hex_chars": 64,
+  "newline": "crlf",
+  "final_newline": true,
+  "hex_case": "lower",
+  "compression": "gzip",
+  "compression_strategy": "rle",
+  "encoding": "base85"
+}
