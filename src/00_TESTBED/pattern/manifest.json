@@ -1,0 +1,436 @@
+{
+  "files": {
+    "activation": {
+      "name": "t00_activation.dat",
+      "sha256": "4f533bd8c2dcbaaa340bfd0c629220c4f1d4219b0e4dceea0f7c262aef2c51e7"
+    },
+    "command": {
+      "name": "t00_command.dat",
+      "sha256": "a8e4c95ee393bd2c4303246eb8c08a1bce461f4ce46091acbad32d08e92bc54a"
+    },
+    "golden": {
+      "name": "t00_golden.dat",
+      "sha256": "80dbabbe5c8ee6e7d64887019ed6dbd8f586e75e2ee9b156de6e7ae20fd5cfa4"
+    },
+    "summary": {
+      "name": "suite_summary.txt",
+      "sha256": "c92a9c780e22a82da442da6aad3d6befc49b3a6346028667f3bcb9f9a2da3827"
+    },
+    "test_suite": {
+      "name": "test_suite.svh",
+      "sha256": "b977041633231693aab40387f6c26ae54b08b6c42d023ca3e89dace364da0192"
+    },
+    "weight": {
+      "name": "t00_weight.dat",
+      "sha256": "73809fd000f7ecf617198a12235d9cfa668cb0e5f9f08351837823a297d4b0ce"
+    }
+  },
+  "format": "tpu-workload-v1",
+  "labels": [
+    7,
+    2,
+    1,
+    0,
+    4,
+    1,
+    4,
+    9,
+    5,
+    9,
+    0,
+    6,
+    9,
+    0,
+    1,
+    5,
+    7,
+    3,
+    4,
+    6,
+    6,
+    5,
+    0,
+    7,
+    1,
+    3,
+    3,
+    2,
+    2,
+    8,
+    8,
+    8
+  ],
+  "layers": [
+    {
+      "act_mode": 1,
+      "activation": "relu",
+      "command_begin": 0,
+      "command_count": 1257,
+      "input_scale": 0.18640201886494953,
+      "input_slots": [
+        0,
+        1,
+        2,
+        3,
+        4,
+        5,
+        6,
+        7,
+        8,
+        9,
+        10,
+        11,
+        12,
+        13,
+        14,
+        15,
+        16,
+        17,
+        18,
+        19,
+        20,
+        21,
+        22,
+        23,
+        24
+      ],
+      "name": "fc1",
+      "output_scale": 0.18060714453641014,
+      "output_slots": [
+        25,
+        26,
+        27,
+        28,
+        29,
+        30,
+        31,
+        32,
+        33,
+        34,
+        35,
+        36,
+        37,
+        38,
+        39,
+        40
+      ],
+      "qmult": 87244,
+      "qshift": 30,
+      "shape": {
+        "K": 784,
+        "M": 32,
+        "N": 512
+      },
+      "stats": {
+        "accumulator_max": 237185,
+        "accumulator_min": -371596,
+        "accumulator_worst_case_bound": 1750412,
+        "activation": {
+          "saturated": 0,
+          "total": 401408
+        },
+        "bias": {
+          "maximum": 1263,
+          "minimum": -1450,
+          "saturated": 0,
+          "total": 512
+        },
+        "output": {
+          "maximum": 19,
+          "minimum": 0,
+          "saturated": 3953,
+          "total": 262144
+        },
+        "requant": {
+          "encoded_factor": 8.125230669975281e-05,
+          "mode": "scale",
+          "payload_mismatch": 1,
+          "rank": null,
+          "reconstruction_mse": 0.03772136491449929,
+          "relative_factor_error": 4.205379258595703e-06,
+          "target_factor": 8.125196500442446e-05,
+          "total": 262144
+        },
+        "rtl_output": {
+          "maximum": 19,
+          "minimum": 0,
+          "saturated": 204,
+          "total": 16384
+        },
+        "weight": {
+          "effective_scale": 0.0001574520005392582,
+          "raw_scale": 0.001331703165384728,
+          "saturated": 0,
+          "total": 401408
+        }
+      },
+      "tiles": {
+        "KT": 25,
+        "MT": 1,
+        "NT": 16
+      },
+      "weight_blocks": [
+        {
+          "nt_begin": 0,
+          "nt_count": 10
+        },
+        {
+          "nt_begin": 10,
+          "nt_count": 6
+        }
+      ],
+      "weight_scale": 0.0001574520005392582,
+      "weight_slots": 250,
+      "weight_tiles": 400
+    },
+    {
+      "act_mode": 1,
+      "activation": "relu",
+      "command_begin": 1257,
+      "command_count": 400,
+      "input_scale": 0.18060714453641014,
+      "input_slots": [
+        25,
+        26,
+        27,
+        28,
+        29,
+        30,
+        31,
+        32,
+        33,
+        34,
+        35,
+        36,
+        37,
+        38,
+        39,
+        40
+      ],
+      "name": "fc2",
+      "output_scale": 0.26555321105287316,
+      "output_slots": [
+        0,
+        1,
+        2,
+        3,
+        4,
+        5,
+        6,
+        7
+      ],
+      "qmult": 109329,
+      "qshift": 31,
+      "shape": {
+        "K": 512,
+        "M": 32,
+        "N": 256
+      },
+      "stats": {
+        "accumulator_max": 316664,
+        "accumulator_min": -193793,
+        "accumulator_worst_case_bound": 1664743,
+        "activation": {
+          "saturated": 3953,
+          "total": 262144
+        },
+        "bias": {
+          "maximum": 2280,
+          "minimum": -1587,
+          "saturated": 0,
+          "total": 256
+        },
+        "output": {
+          "maximum": 16,
+          "minimum": 0,
+          "saturated": 1661,
+          "total": 131072
+        },
+        "requant": {
+          "encoded_factor": 5.0910282880067825e-05,
+          "mode": "scale",
+          "payload_mismatch": 0,
+          "rank": null,
+          "reconstruction_mse": 0.04560173129017346,
+          "relative_factor_error": 3.7234088619161085e-06,
+          "target_factor": 5.0910472440572075e-05,
+          "total": 131072
+        },
+        "rtl_output": {
+          "maximum": 11,
+          "minimum": 0,
+          "saturated": 50,
+          "total": 8192
+        },
+        "weight": {
+          "effective_scale": 0.0001497110146723705,
+          "raw_scale": 0.001231092519647493,
+          "saturated": 0,
+          "total": 131072
+        }
+      },
+      "tiles": {
+        "KT": 16,
+        "MT": 1,
+        "NT": 8
+      },
+      "weight_blocks": [
+        {
+          "nt_begin": 0,
+          "nt_count": 8
+        }
+      ],
+      "weight_scale": 0.0001497110146723705,
+      "weight_slots": 128,
+      "weight_tiles": 128
+    },
+    {
+      "act_mode": 0,
+      "activation": "none",
+      "command_begin": 1657,
+      "command_count": 26,
+      "input_scale": 0.26555321105287316,
+      "input_slots": [
+        0,
+        1,
+        2,
+        3,
+        4,
+        5,
+        6,
+        7
+      ],
+      "name": "fc3",
+      "output_scale": 0.6124576194496834,
+      "output_slots": [
+        8
+      ],
+      "qmult": 99257,
+      "qshift": 31,
+      "shape": {
+        "K": 256,
+        "M": 32,
+        "N": 10
+      },
+      "stats": {
+        "accumulator_max": 308443,
+        "accumulator_min": -343160,
+        "accumulator_worst_case_bound": 1203976,
+        "activation": {
+          "saturated": 1661,
+          "total": 131072
+        },
+        "bias": {
+          "maximum": 1202,
+          "minimum": -1149,
+          "saturated": 0,
+          "total": 10
+        },
+        "output": {
+          "maximum": 14,
+          "minimum": -16,
+          "saturated": 601,
+          "total": 5120
+        },
+        "requant": {
+          "encoded_factor": 4.6220142394304276e-05,
+          "mode": "rank",
+          "payload_mismatch": 1534,
+          "rank": {
+            "agreement": 511,
+            "base_factor": 2.8855345951304513e-05,
+            "candidate_count": 257,
+            "selected_factor": 4.6220142394304276e-05,
+            "tie_rows": 5,
+            "total": 512
+          },
+          "reconstruction_mse": 1.2386056920908306,
+          "relative_factor_error": 0.6017878445229565,
+          "target_factor": 2.8855345951304513e-05,
+          "total": 5120
+        },
+        "rtl_output": {
+          "maximum": 12,
+          "minimum": -13,
+          "saturated": 36,
+          "total": 1024
+        },
+        "weight": {
+          "effective_scale": 0.00019204460396998423,
+          "raw_scale": 0.0015524879215270515,
+          "saturated": 0,
+          "total": 2560
+        }
+      },
+      "tiles": {
+        "KT": 8,
+        "MT": 1,
+        "NT": 1
+      },
+      "weight_blocks": [
+        {
+          "nt_begin": 0,
+          "nt_count": 1
+        }
+      ],
+      "weight_scale": 0.00019204460396998423,
+      "weight_slots": 8,
+      "weight_tiles": 8
+    }
+  ],
+  "name": "mnist_mlp_784_512_256_10",
+  "predictions": [
+    7,
+    2,
+    1,
+    0,
+    4,
+    1,
+    4,
+    9,
+    5,
+    9,
+    0,
+    6,
+    9,
+    0,
+    1,
+    5,
+    7,
+    3,
+    4,
+    6,
+    6,
+    5,
+    0,
+    7,
+    1,
+    3,
+    3,
+    2,
+    2,
+    8,
+    8,
+    8
+  ],
+  "rtl_batch_accuracy": 1.0,
+  "source_model": "compiled_model.json",
+  "target": {
+    "accumulator_width": 29,
+    "activation_width": 4,
+    "array_size": 32,
+    "ub_slots": 512,
+    "weight_width": 8,
+    "wmem_slots": 256
+  },
+  "test": {
+    "K": 784,
+    "M": 32,
+    "N": 10,
+    "activation_rows": 800,
+    "command_count": 1683,
+    "golden_rows": 800,
+    "name": "mnist_mlp_784_512_256_10_rtl",
+    "weight_rows": 17252
+  }
+}

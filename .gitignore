@@ -1,13 +1,6 @@
 # ---- generated verification patterns -------------------------------------
 # Regenerate with :  cd src/00_TESTBED && python3 directed/gen_suite.py
 # test_suite.svh and suite_summary.txt describe the active workload.
-src/00_TESTBED/pattern/*
-!src/00_TESTBED/pattern/test_suite.svh
-!src/00_TESTBED/pattern/suite_summary.txt
-!src/00_TESTBED/pattern/activation.dat
-!src/00_TESTBED/pattern/golden.dat
-!src/00_TESTBED/pattern/weight_raw.dat
-src/10_VERI/*/00_TESTBED/pattern/
 
 # ---- VCS / Verdi ----------------------------------------------------------
 simv
