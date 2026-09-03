@@ -42,13 +42,16 @@ set sh_enable_line_editing true
 history keep 1000
 alias h history
 set sh_continue_on_error false
-set compile_preserve_subdesign_interfaces true
+# set compile_preserve_subdesign_interfaces true
+set_host_options -max_cores 8
 
 #=================================================================
 #--------------------- TOP Module Definition ---------------------
 #=================================================================
 set DESIGN  "TPU"
 set CYCLE 2
+set SETUP_UNCERTAINTY 0.1
+set HOLD_UNCERTAINTY 0.005
 
 #=================================================================
 #------------- Create the Working and Saving Folders -------------
@@ -72,7 +75,7 @@ set_operating_conditions \
     -max_library N16ADFP_StdCellss0p72vm40c_ccs \
     -max ss0p72vm40c \
     -min_library N16ADFP_StdCellff0p88v125c_ccs \
-    -min ff0p88vm125c
+    -min ff0p88v125c
 
 #=================================================================
 #------------------------- Create Clock --------------------------
@@ -80,9 +83,8 @@ set_operating_conditions \
 create_clock -name clk -period $CYCLE [get_ports clk]
 set_dont_touch [all_clocks]
 set_ideal_network [all_clocks]
-set_fix_hold [all_clocks]
-set_clock_uncertainty -setup 0.5 [all_clocks] 
-set_clock_uncertainty -hold 0.005 [all_clocks]
+set_clock_uncertainty -setup $SETUP_UNCERTAINTY [all_clocks]
+set_clock_uncertainty -hold $HOLD_UNCERTAINTY [all_clocks]
 set_clock_latency 0.5 [all_clocks]
 set_clock_latency -source 0 [all_clocks]
 set_clock_transition 0.2 [all_clocks]
@@ -101,7 +103,6 @@ set_driving_cell -library "N16ADFP_StdCellss0p72vm40c_ccs" -lib_cell BUFFD4BWP16
 set_driving_cell -library "N16ADFP_StdCellss0p72vm40c_ccs" -lib_cell DFQD1BWP16P90LVT -pin {Q} [remove_from_collection [all_inputs] [get_ports clk]]
 set_load [load_of "N16ADFP_StdCellss0p72vm40c_ccs/DFQD1BWP16P90LVT/D"] [all_outputs]
 
-set_max_area 0
 set_max_capacitance 0.1 [all_inputs]
 set_max_fanout 10 [all_inputs]
 set_max_transition 0.2 [all_inputs]
@@ -115,16 +116,20 @@ set_fix_multiple_port_nets -all -buffer_constants [get_designs *]
 current_design $DESIGN
 compile_ultra
 
+# Fix hold after setup optimization.
+set_fix_hold [get_clocks clk]
+compile_ultra -incremental
+
 #=================================================================
 #------------------------ Report & Output ------------------------
 #=================================================================
 current_design $DESIGN
-report_timing > Report/${DESIGN}_syn.timing
-report_area -hierarchy > Report/${DESIGN}_syn.area
-report_power -hierarchy > Report/${DESIGN}_syn.power
-report_qor > Report/${DESIGN}_syn.qor
-report_constraint -all_violators > Report/${DESIGN}_syn.violators
-report_reference > Report/${DESIGN}_syn.reference
+report_timing -delay_type max -path full -max_paths 20 > Report/setup_timing.rpt
+report_timing -delay_type min -path full -max_paths 20 > Report/hold_timing.rpt
+report_qor > Report/qor.rpt
+report_constraint -all_violators > Report/constraint.rpt
+report_area -hierarchy > Report/area.rpt
+report_power -hierarchy > Report/power.rpt
 
 set bus_inference_style {%s[%d]}
 set bus_naming_style {%s[%d]}
