@@ -25,7 +25,7 @@ module TPU (
 
     output r_valid,
     input r_ready,
-    output [`R_BW-1:0] r_data,
+    output logic [`R_BW-1:0] r_data,
 
     output busy,
     output done
@@ -37,6 +37,7 @@ module TPU (
     logic [`UB_ADDR_W-1:0] ub_addr;
     logic ub_en, ub_we;
     logic r_from_ub;
+    logic r_load;
     logic weight_valid, skew_en, activation_valid;
     logic [`ROW_IDX_W-1:0] activation_row_idx;
     logic amask_init, amask_default_valid, amask_wr_en;
@@ -77,9 +78,13 @@ module TPU (
     logic [`ACT_MODE_W-1:0] act_mode_q;
 
     assign wmem_mem_addr = (wmem_we)? wpu_wmem_addr : wmem_addr;
-    assign ub_data_i = (r_valid && !r_from_ub)? op_data : a_data;
+    assign ub_data_i = (r_load && !r_from_ub)? op_data : a_data;
     assign activation_row = (activation_valid)? ub_data_o : 0;
-    assign r_data = (r_from_ub)? ub_r_data : op_r_data;
+
+    always_ff @(posedge clk or negedge rst_n) begin : RESULT_OUTPUT
+        if(!rst_n) r_data <= 0;
+        else if(r_load) r_data <= (r_from_ub)? ub_r_data : op_r_data;
+    end
 
     always_ff @(posedge clk or negedge rst_n) begin : ACTIVATION_MASK
         if(!rst_n) begin
@@ -125,6 +130,7 @@ module TPU (
         .a_ready(a_ready),
         .r_valid(r_valid),
         .r_from_ub(r_from_ub),
+        .r_load(r_load),
         .r_ready(r_ready),
         .wpu_wmem_w(wpu_wmem_w),
         .wmem_addr(wmem_addr),

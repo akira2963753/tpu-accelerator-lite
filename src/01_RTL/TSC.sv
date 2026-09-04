@@ -24,6 +24,7 @@ module TSC (
     output logic a_ready,
     output logic r_valid,
     output logic r_from_ub,
+    output logic r_load,
     input r_ready,
 
     output logic wpu_wmem_w,
@@ -128,6 +129,10 @@ module TSC (
     wire w_beat;
     wire bias_beat;
     wire ru_issue;
+    wire result_ready;
+    wire result_source_valid;
+    wire store_issue;
+    wire read_result;
     wire [TILE_CNT_W-1:0] a_limit;
 
     assign a_limit = (a_mask_en_q)? (`ARRAY_S + `AMASK_BEATS) : `ARRAY_S;
@@ -135,9 +140,15 @@ module TSC (
     assign w_beat = (state == LOAD_W) && w_valid && (w_cnt != `ARRAY_S);
     assign bias_beat = (state == LOAD_BIAS) && w_valid &&
                        (bias_cnt != `BIAS_BEATS);
+    assign result_ready = !r_valid_q || r_ready;
+    assign result_source_valid = ((state == STORE_C) && (ov < `ARRAY_S)) ||
+                                 ((state == READ_UB) && ru_valid_q);
+    assign store_issue = (state == STORE_C) &&
+                         (ov < `ARRAY_S) && result_ready;
+    assign read_result = (state == READ_UB) && ru_valid_q && result_ready;
     assign ru_issue = (state == READ_UB) &&
                       (ru_cnt < `ARRAY_S) &&
-                      (!ru_valid_q || r_ready);
+                      (!ru_valid_q || result_ready);
 
     logic en_chain [0:`ARRAY_S-1];
     logic [`ROW_IDX_W-1:0] row_chain [0:`ARRAY_S-1];
@@ -150,6 +161,7 @@ module TSC (
     assign res_row = cc - RESULT_LAT;
 
     logic wmem_wr_q;
+    logic r_valid_q;
 
     always_comb begin : NEXT_STATE
         case(state)
@@ -189,11 +201,12 @@ module TSC (
                 else nx_state = GEMM;
             end
             STORE_C: begin
-                if(r_ready && ov == `ARRAY_S-1) nx_state = DONE;
+                if((ov == `ARRAY_S) && r_valid_q && r_ready) nx_state = DONE;
                 else nx_state = STORE_C;
             end
             READ_UB: begin
-                if(ru_valid_q && r_ready && ru_cnt == `ARRAY_S) nx_state = DONE;
+                if((ru_cnt == `ARRAY_S) && !ru_valid_q &&
+                   r_valid_q && r_ready) nx_state = DONE;
                 else nx_state = READ_UB;
             end
             DONE: nx_state = IDLE;
@@ -227,6 +240,7 @@ module TSC (
             ru_cnt <= 0;
             ru_valid_q <= 0;
             wmem_wr_q <= 0;
+            r_valid_q <= 0;
         end
         else begin
             if(cmd_accept) begin
@@ -280,10 +294,7 @@ module TSC (
             end
 
             if(state == STORE_C) begin
-                if(r_ready) begin
-                    if(ov == `ARRAY_S-1) ov <= 0;
-                    else ov <= ov + 1'b1;
-                end
+                if(store_issue) ov <= ov + 1'b1;
             end
             else begin
                 ov <= 0;
@@ -293,12 +304,14 @@ module TSC (
                 if(ru_issue) ru_cnt <= ru_cnt + 1'b1;
 
                 if(ru_issue) ru_valid_q <= 1'b1;
-                else if(ru_valid_q && r_ready) ru_valid_q <= 1'b0;
+                else if(read_result) ru_valid_q <= 1'b0;
             end
             else begin
                 ru_cnt <= 0;
                 ru_valid_q <= 0;
             end
+
+            if(result_ready) r_valid_q <= result_source_valid;
 
             wmem_wr_q <= w_beat;
         end
@@ -329,8 +342,9 @@ module TSC (
         w_ready = ((state == LOAD_W) && (w_cnt != `ARRAY_S)) ||
                   ((state == LOAD_BIAS) && (bias_cnt != `BIAS_BEATS));
         a_ready = (state == LOAD_A) && (a_cnt != a_limit);
-        r_valid = (state == STORE_C) || ((state == READ_UB) && ru_valid_q);
+        r_valid = r_valid_q;
         r_from_ub = (state == READ_UB);
+        r_load = result_source_valid && result_ready;
 
         amask_init = cmd_accept && (cmd_op == `CMD_OP_LOAD_A);
         amask_default_valid = !cmd_a_mask_en;
@@ -369,7 +383,7 @@ module TSC (
             ub_addr = {src_slot_q, cc[`ROW_IDX_W-1:0]};
             ub_en = 1'b1;
         end
-        else if(state == STORE_C && r_ready) begin
+        else if(store_issue) begin
             ub_addr = {dst_slot_q, ov[`ROW_IDX_W-1:0]};
             ub_en = 1'b1;
             ub_we = 1'b1;
