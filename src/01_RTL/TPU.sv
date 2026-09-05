@@ -12,6 +12,7 @@ module TPU (
     input clk,
     input rst_n,
 
+    // Function Mode
     input cmd_valid,
     output cmd_ready,
     input [`CMD_DESC_W-1:0] cmd_desc,
@@ -29,6 +30,11 @@ module TPU (
 
     output busy,
     output done
+    
+    // Test (Scan) Mode
+    input scan_en,
+    input [`SCAN_N-1:0] scan_in,
+    output [`SCAN_N-1:0] scan_out
 );
 
     logic wpu_wmem_w;
