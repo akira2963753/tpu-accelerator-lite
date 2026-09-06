@@ -412,6 +412,12 @@ module PATTERN (
     )
     else $fatal(1, "[ERROR]: Host input changed while stalled");
 
+    HOST_TYPE_VALID: assert property(
+        @(posedge clk) disable iff(!rst_n)
+        host_valid |-> host_type inside {`HOST_TYPE_CMD, `HOST_TYPE_WEIGHT, `HOST_TYPE_ACTIVATION}
+    )
+    else $fatal(1, "[ERROR]: Host input used reserved packet type");
+
     HOST_OUTPUT_STABLE: assert property(
         @(posedge clk) disable iff(!rst_n)
         host_out_valid && !host_out_ready |=> host_out_valid && $stable(host_data_o)

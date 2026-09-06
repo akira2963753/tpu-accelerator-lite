@@ -50,8 +50,8 @@ module TPU_IO_BRIDGE (
     logic [`CMD_DESC_W-1:0] input_buffer;
     logic [INPUT_BEAT_W-1:0] input_beat;
     logic [`HOST_TYPE_W-1:0] active_type, pending_type;
+    logic [`HOST_TYPE_W-1:0] packet_type;
     logic pending_valid;
-    logic valid_host_type;
     logic last_input_beat;
     logic pending_ready;
     logic input_accept;
@@ -65,13 +65,15 @@ module TPU_IO_BRIDGE (
     //                    Host Input Interface
     //=============================================================
     always_comb begin : HOST_INPUT_CONTROL
-        valid_host_type = 1'b1;
+        packet_type = active_type;
         last_input_beat = 1'b0;
-        case(host_type)
+        if(input_beat == 0) packet_type = host_type;
+
+        case(packet_type)
             `HOST_TYPE_CMD: last_input_beat = (input_beat == `HOST_CMD_BEATS-1);
             `HOST_TYPE_WEIGHT: last_input_beat = (input_beat == `HOST_WEIGHT_BEATS-1);
             `HOST_TYPE_ACTIVATION: last_input_beat = (input_beat == `HOST_ACTIVATION_BEATS-1);
-            default: valid_host_type = 1'b0;
+            default: last_input_beat = 1'b0;
         endcase
     end
 
@@ -84,8 +86,6 @@ module TPU_IO_BRIDGE (
         endcase
     end
 
-    assign host_ready = !pending_valid && valid_host_type &&
-                        ((input_beat == 0) || (host_type == active_type));
     assign input_accept = host_valid && host_ready;
 
     assign core_cmd_valid = pending_valid && (pending_type == `HOST_TYPE_CMD);
@@ -102,9 +102,13 @@ module TPU_IO_BRIDGE (
             active_type <= `HOST_TYPE_CMD;
             pending_type <= `HOST_TYPE_CMD;
             pending_valid <= 1'b0;
+            host_ready <= 1'b1;
         end
         else begin
-            if(pending_valid && pending_ready) pending_valid <= 1'b0;
+            if(pending_valid && pending_ready) begin
+                pending_valid <= 1'b0;
+                host_ready <= 1'b1;
+            end
 
             if(input_accept) begin
                 input_buffer[input_beat*`HOST_DATA_W +: `HOST_DATA_W] <= host_data_i;
@@ -112,8 +116,9 @@ module TPU_IO_BRIDGE (
 
                 if(last_input_beat) begin
                     input_beat <= '0;
-                    pending_type <= host_type;
+                    pending_type <= packet_type;
                     pending_valid <= 1'b1;
+                    host_ready <= 1'b0;
                 end
                 else input_beat <= input_beat + 1'b1;
             end
@@ -157,7 +162,7 @@ module TPU_IO_BRIDGE (
 
     always_ff @(posedge clk or negedge rst_n) begin : HOST_DONE_STATUS
         if(!rst_n) host_done_q <= 1'b0;
-        else if(input_accept && last_input_beat && (host_type == `HOST_TYPE_CMD)) host_done_q <= 1'b0;
+        else if(input_accept && last_input_beat && (packet_type == `HOST_TYPE_CMD)) host_done_q <= 1'b0;
         else if(core_done) host_done_q <= 1'b1;
     end
 
