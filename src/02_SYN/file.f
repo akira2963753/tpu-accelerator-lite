@@ -10,3 +10,5 @@
 -sverilog ../01_RTL/OP.sv
 -sverilog ../01_RTL/TSC.sv
 -sverilog ../01_RTL/TPU.sv
+-sverilog ../01_RTL/TPU_IO_BRIDGE.sv
+-sverilog ../01_RTL/CHIP_TOP.sv

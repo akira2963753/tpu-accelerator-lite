@@ -83,6 +83,16 @@
     `define CMD_DESC_W 512
     `define CMD_OP_W   3
 
+    `define HOST_DATA_W 32
+    `define HOST_TYPE_W 2
+    `define HOST_TYPE_CMD 2'd0
+    `define HOST_TYPE_WEIGHT 2'd1
+    `define HOST_TYPE_ACTIVATION 2'd2
+    `define HOST_CMD_BEATS (`CMD_DESC_W / `HOST_DATA_W)
+    `define HOST_WEIGHT_BEATS (`W_RAW_BW / `HOST_DATA_W)
+    `define HOST_ACTIVATION_BEATS (`A_BW / `HOST_DATA_W)
+    `define HOST_RESULT_BEATS (`R_BW / `HOST_DATA_W)
+
     `define CMD_OP_NOP       3'd0
     `define CMD_OP_LOAD_W    3'd1
     `define CMD_OP_PRELOAD_W 3'd2

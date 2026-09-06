@@ -12,18 +12,13 @@
 module PATTERN (
     output logic clk,
     output logic rst_n,
-    output logic cmd_valid,
-    input logic cmd_ready,
-    output logic [`CMD_DESC_W-1:0] cmd_desc,
-    output logic w_valid,
-    input logic w_ready,
-    output logic [`W_RAW_BW-1:0] w_data,
-    output logic a_valid,
-    input logic a_ready,
-    output logic [`A_BW-1:0] a_data,
-    output logic r_ready,
-    input logic r_valid,
-    input logic [`R_BW-1:0] r_data,
+    output logic [`HOST_DATA_W-1:0] host_data_i,
+    output logic [`HOST_TYPE_W-1:0] host_type,
+    output logic host_valid,
+    input logic host_ready,
+    input logic [`HOST_DATA_W-1:0] host_data_o,
+    input logic host_out_valid,
+    output logic host_out_ready,
     input logic busy,
     input logic done
 );
@@ -76,15 +71,13 @@ module PATTERN (
     //                            Reset
     //=============================================================
     task automatic drive_reset();
-        force clk = 1'b0;
+        host_data_i = '0;
+        host_type = `HOST_TYPE_CMD;
+        host_valid = 1'b0;
+        host_out_ready = 1'b0;
+
         rst_n = 1'b1;
-        cmd_valid = 1'b0;
-        cmd_desc = '0;
-        w_valid = 1'b0;
-        w_data = '0;
-        a_valid = 1'b0;
-        a_data = '0;
-        r_ready = 1'b0;
+        force clk = 1'b0;
         #20 rst_n = 1'b0;
         #20 rst_n = 1'b1;
         release clk;
@@ -152,21 +145,32 @@ module PATTERN (
     endtask
 
     //=============================================================
-    //                        Command Tasks
+    //                      Host Input Tasks
     //=============================================================
+    task automatic send_host_packet(
+        input logic [`HOST_TYPE_W-1:0] packet_type,
+        input logic [`CMD_DESC_W-1:0] packet_data,
+        input int beat_count
+    );
+        for(int beat = 0; beat < beat_count; beat++) begin
+            host_type = packet_type;
+            host_data_i = packet_data[beat*`HOST_DATA_W +: `HOST_DATA_W];
+            host_valid = 1'b1;
+            while(!host_ready) @(negedge clk);
+            @(negedge clk);
+        end
+        host_data_i = '0;
+        host_type = `HOST_TYPE_CMD;
+        host_valid = 1'b0;
+    endtask
+
     task automatic issue_command(
         input logic [`CMD_DESC_W-1:0] desc,
         input int index
     );
         check_descriptor(desc, index);
-        while(!cmd_ready) @(negedge clk);
         if(busy) $fatal(1, "[ERROR] : TPU busy before t%02d cmd%0d", cur_test, index);
-
-        cmd_desc = desc;
-        cmd_valid = 1;
-        @(negedge clk);
-        cmd_valid = 0;
-        cmd_desc = '0;
+        send_host_packet(`HOST_TYPE_CMD, desc, `HOST_CMD_BEATS);
     endtask
 
     task automatic wait_command_done(
@@ -180,7 +184,7 @@ module PATTERN (
         end
         if(!done) $fatal(1, "[ERROR] : t%02d cmd%0d timeout", cur_test, index);
 
-        while(!cmd_ready) @(negedge clk);
+        while(busy) @(negedge clk);
         if(busy) $fatal(1, "[ERROR] : TPU remains busy after t%02d cmd%0d", cur_test, index);
     endtask
 
@@ -191,6 +195,7 @@ module PATTERN (
         input int beat_count
     );
         int gap_cycles;
+        logic [`CMD_DESC_W-1:0] packet_data;
         for(int row = 0; row < beat_count; row++) begin
             if(w_ptr >= TEST_W_ROWS[cur_test]) $fatal(1, "[ERROR] : t%02d weight stream overflow", cur_test);
 
@@ -200,22 +205,20 @@ module PATTERN (
                 default: gap_cycles = 0;
             endcase
 
-            w_valid = 0;
-            w_data = mem_w[w_ptr];
+            host_valid = 1'b0;
             repeat(gap_cycles) @(negedge clk);
-            w_valid = 1;
-            while(!w_ready) @(negedge clk);
-            @(negedge clk);
+            packet_data = '0;
+            packet_data[`W_RAW_BW-1:0] = mem_w[w_ptr];
+            send_host_packet(`HOST_TYPE_WEIGHT, packet_data, `HOST_WEIGHT_BEATS);
             w_ptr++;
         end
-        w_valid = 0;
-        w_data = '0;
     endtask
 
     task automatic feed_activation_stream(
         input int beat_count
     );
         int gap_cycles;
+        logic [`CMD_DESC_W-1:0] packet_data;
         for(int row = 0; row < beat_count; row++) begin
             if(a_ptr >= TEST_A_ROWS[cur_test]) $fatal(1, "[ERROR] : t%02d activation stream overflow", cur_test);
 
@@ -225,63 +228,70 @@ module PATTERN (
                 default: gap_cycles = 0;
             endcase
 
-            a_valid = 0;
-            a_data = mem_a[a_ptr];
+            host_valid = 1'b0;
             repeat(gap_cycles) @(negedge clk);
-            a_valid = 1;
-            while(!a_ready) @(negedge clk);
-            @(negedge clk);
+            packet_data = '0;
+            packet_data[`A_BW-1:0] = mem_a[a_ptr];
+            send_host_packet(`HOST_TYPE_ACTIVATION, packet_data, `HOST_ACTIVATION_BEATS);
             a_ptr++;
         end
-        a_valid = 0;
-        a_data = '0;
     endtask
 
     task automatic monitor_result_tile();
+        int word;
         int beat;
         int phase;
         logic hold_active;
-        logic [`R_BW-1:0] hold_data;
+        logic [`HOST_DATA_W-1:0] hold_data;
+        logic [`R_BW-1:0] result_word;
+        word = 0;
         beat = 0;
         phase = 0;
         hold_active = 0;
         hold_data = '0;
-        while(beat < `ARRAY_S) begin
-            case(TEST_RSTALL[cur_test])
-                1: r_ready = (phase % 5 != 2);
-                2: r_ready = !((phase % 9 >= 2) && (phase % 9 <= 5));
-                default: r_ready = 1;
-            endcase
+        while(word < `ARRAY_S) begin
+            result_word = '0;
+            beat = 0;
+            while(beat < `HOST_RESULT_BEATS) begin
+                case(TEST_RSTALL[cur_test])
+                    1: host_out_ready = (phase % 5 != 2);
+                    2: host_out_ready = !((phase % 9 >= 2) && (phase % 9 <= 5));
+                    default: host_out_ready = 1'b1;
+                endcase
 
-            if($isunknown(r_valid)) $fatal(1, "[ERROR] : t%02d r_valid is X/Z", cur_test);
-            if(r_valid && $isunknown(r_data)) $fatal(1, "[ERROR] : t%02d result beat contains X/Z", cur_test);
+                if($isunknown(host_out_valid)) $fatal(1, "[ERROR] : t%02d host_out_valid is X/Z", cur_test);
+                if(host_out_valid && $isunknown(host_data_o)) $fatal(1, "[ERROR] : t%02d result beat contains X/Z", cur_test);
 
-            if(hold_active) begin
-                if(!r_valid) $fatal(1, "[ERROR] : t%02d r_valid dropped during stall", cur_test);
-                if(r_data !== hold_data) $fatal(1, "[ERROR] : t%02d r_data changed during stall", cur_test);
-            end
-
-            if(r_valid && !r_ready && !hold_active) begin
-                hold_active = 1;
-                hold_data = r_data;
-            end
-
-            if(r_valid && r_ready) begin
-                if(r_ptr >= TEST_R_ROWS[cur_test]) $fatal(1, "[ERROR] : t%02d result stream overflow", cur_test);
-                if(r_data !== mem_g[r_ptr]) begin
-                    if(err_this < 8) $display("  [MISMATCH] t%02d beat=%0d exp=%064h got=%064h",
-                        cur_test, r_ptr, mem_g[r_ptr], r_data);
-                    err_this++;
+                if(hold_active) begin
+                    if(!host_out_valid) $fatal(1, "[ERROR] : t%02d host_out_valid dropped during stall", cur_test);
+                    if(host_data_o !== hold_data) $fatal(1, "[ERROR] : t%02d host_data_o changed during stall", cur_test);
                 end
-                hold_active = 0;
-                beat++;
-                r_ptr++;
+
+                if(host_out_valid && !host_out_ready && !hold_active) begin
+                    hold_active = 1'b1;
+                    hold_data = host_data_o;
+                end
+
+                if(host_out_valid && host_out_ready) begin
+                    result_word[beat*`HOST_DATA_W +: `HOST_DATA_W] = host_data_o;
+                    hold_active = 1'b0;
+                    beat++;
+                end
+                phase++;
+                if(phase > CMD_TIMEOUT) $fatal(1, "[ERROR] : t%02d result timeout", cur_test);
+                @(negedge clk);
             end
-            phase++;
-            if(phase > CMD_TIMEOUT) $fatal(1, "[ERROR] : t%02d result timeout", cur_test);
-            @(negedge clk);
+
+            if(r_ptr >= TEST_R_ROWS[cur_test]) $fatal(1, "[ERROR] : t%02d result stream overflow", cur_test);
+            if(result_word !== mem_g[r_ptr]) begin
+                if(err_this < 8) $display("  [MISMATCH] t%02d beat=%0d exp=%064h got=%064h",
+                    cur_test, r_ptr, mem_g[r_ptr], result_word);
+                err_this++;
+            end
+            word++;
+            r_ptr++;
         end
-        r_ready = 0;
+        host_out_ready = 1'b0;
     endtask
 
     //=============================================================
@@ -392,5 +402,26 @@ module PATTERN (
         if(tests_fail != 0) $fatal(1, "[ERROR] : TPU verification failed");
         $finish;
     end
+
+    //=============================================================
+    //                 SystemVerilog Assertion
+    //=============================================================
+    HOST_INPUT_STABLE: assert property(
+        @(posedge clk) disable iff(!rst_n)
+        host_valid && !host_ready |=> host_valid && $stable({host_type, host_data_i})
+    )
+    else $fatal(1, "[ERROR]: Host input changed while stalled");
+
+    HOST_OUTPUT_STABLE: assert property(
+        @(posedge clk) disable iff(!rst_n)
+        host_out_valid && !host_out_ready |=> host_out_valid && $stable(host_data_o)
+    )
+    else $fatal(1, "[ERROR]: Host output changed while stalled");
+
+    CHECK_RESET_VALID_LOW: assert property(
+        @(posedge clk)
+        !rst_n |-> (!host_out_valid && !busy && !done)
+    )
+    else $fatal(1, "[ERROR]: Output valid or status asserted during reset");
 
 endmodule

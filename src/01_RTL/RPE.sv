@@ -80,8 +80,7 @@ module RMAC (
         product_ext = {{(`RPE_RES_W-`RPE_MUL_W){product[`RPE_MUL_W-1]}}, product};
         contribution = (weight[`RW_W-1])? product_ext <<< 6 : product_ext <<< 3;
         contribution_ext = {{(`PSUM_W-`RPE_RES_W){contribution[`RPE_RES_W-1]}}, contribution};
-        psum_o = (activation_valid)?
-            $signed(psum_i) + contribution_ext : $signed(psum_i);
+        psum_o = (activation_valid)? $signed(psum_i) + contribution_ext : $signed(psum_i);
     end
 
 endmodule

@@ -9,7 +9,7 @@
 #======================================================
 #              Set your desired file names
 #======================================================
-top_design=TPU
+top_design=CHIP_TOP
 source_file="file.f"
 TIMESCALE="-timescale=1ns/1ps"
 syn_tcl="syn16.tcl"

@@ -30,11 +30,6 @@ module TPU (
 
     output busy,
     output done
-    
-    // Test (Scan) Mode
-    input scan_en,
-    input [`SCAN_N-1:0] scan_in,
-    output [`SCAN_N-1:0] scan_out
 );
 
     logic wpu_wmem_w;

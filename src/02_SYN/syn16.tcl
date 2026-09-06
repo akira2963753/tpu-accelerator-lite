@@ -48,8 +48,8 @@ set_host_options -max_cores 8
 #=================================================================
 #--------------------- TOP Module Definition ---------------------
 #=================================================================
-set DESIGN  "TPU"
-set CYCLE 2
+set DESIGN  "CHIP_TOP"
+set CYCLE 1
 set SETUP_UNCERTAINTY 0.1
 set HOLD_UNCERTAINTY 0.005
 
