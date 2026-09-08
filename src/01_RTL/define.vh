@@ -83,7 +83,7 @@
     `define CMD_DESC_W 512
     `define CMD_OP_W   3
 
-    `define HOST_DATA_W 32
+    `define HOST_DATA_W 8
     `define HOST_TYPE_W 2
     `define HOST_TYPE_CMD 2'd0
     `define HOST_TYPE_WEIGHT 2'd1
